@@ -1,0 +1,53 @@
+{
+  "_meta": {
+    "product_name": "センサーケース（サンプル）",
+    "version": "1.0.0",
+    "generated_by": "text-to-cad skill",
+    "last_modified": "2026-03-02T12:00:00Z"
+  },
+
+  "global": {
+    "wall_thickness":    { "value": 2.0,  "unit": "mm", "note": "全体の肉厚",
+                           "recommended_range": [1.0, 5.0],
+                           "constraint": "3Dプリント(FDM): ≥1.2mm, 射出成形: ≥0.8mm" },
+    "fillet_radius":     { "value": 1.5,  "unit": "mm", "note": "外側エッジR",
+                           "recommended_range": [0.5, 5.0] },
+    "fit_clearance":     { "value": 0.2,  "unit": "mm", "note": "嵌合クリアランス（片側）",
+                           "recommended_range": [0.1, 0.3],
+                           "constraint": "3Dプリント: 0.2〜0.3推奨, 射出成形: 0.05〜0.15推奨" }
+  },
+
+  "outer_envelope": {
+    "width":  { "value": 120.0, "unit": "mm", "note": "最外形 幅",   "critical": true },
+    "depth":  { "value": 80.0,  "unit": "mm", "note": "最外形 奥行", "critical": true },
+    "height": { "value": 40.0,  "unit": "mm", "note": "最外形 高さ", "critical": true }
+  },
+
+  "mounting_interface": {
+    "bolt_hole_diameter":   { "value": 3.2,   "unit": "mm", "note": "M3ボルト穴径",       "critical": true },
+    "bolt_hole_pitch_x":    { "value": 100.0, "unit": "mm", "note": "取付穴ピッチ X方向", "critical": true },
+    "bolt_hole_pitch_y":    { "value": 60.0,  "unit": "mm", "note": "取付穴ピッチ Y方向", "critical": true },
+    "counterbore_diameter":  { "value": 6.0,  "unit": "mm", "note": "座ぐり径" },
+    "counterbore_depth":     { "value": 3.0,  "unit": "mm", "note": "座ぐり深さ" }
+  },
+
+  "internal_cavity": {
+    "pcb_width":           { "value": 85.0,  "unit": "mm", "note": "基板幅" },
+    "pcb_depth":           { "value": 55.0,  "unit": "mm", "note": "基板奥行" },
+    "pcb_standoff_height": { "value": 5.0,   "unit": "mm", "note": "基板スタンドオフ高さ" },
+    "pcb_mount_hole_dia":  { "value": 2.5,   "unit": "mm", "note": "基板取付穴径", "critical": true }
+  },
+
+  "openings": {
+    "cable_hole_diameter": { "value": 12.5, "unit": "mm", "note": "ケーブルグランド穴径 (PG7)", "critical": true },
+    "cable_hole_offset_z": { "value": 20.0, "unit": "mm", "note": "ケーブル穴 底面からの高さ" },
+    "led_window_width":    { "value": 12.0, "unit": "mm", "note": "LED窓 幅" },
+    "led_window_height":   { "value": 3.0,  "unit": "mm", "note": "LED窓 高さ" }
+  },
+
+  "lid_interface": {
+    "snap_fit_width":      { "value": 5.0,  "unit": "mm", "note": "スナップフィット爪幅" },
+    "snap_fit_depth":      { "value": 1.5,  "unit": "mm", "note": "スナップフィット爪掛かり量" },
+    "lid_overlap":         { "value": 3.0,  "unit": "mm", "note": "蓋の嵌合深さ" }
+  }
+}

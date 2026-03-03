@@ -1,0 +1,8 @@
+Generate a {view_type} of a {product_name}.
+Description: {description}.
+Approximate dimensions: {width}mm wide × {depth}mm deep × {height}mm tall.
+Style: clean industrial design render, white background, studio lighting, no text overlays, no watermarks, professional product photography.
+Key features: {feature_list}.
+Material appearance: {materials}.
+Manufacturing method: {manufacturing}.
+{sketch_instruction}

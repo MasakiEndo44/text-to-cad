@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Stage 2: SVG 技術図面生成スクリプト
+Stage 2: SVG 技術図面生成スクリプト (v3 — 正投影図法準拠)
 
 requirements.json または parameters.json から
-正面図・側面図・上面図・等角図を含む工業図面スタイルの SVG を生成する。
+正面図・側面図・底面図の3面図を含む工業図面スタイルの SVG を生成する。
+
+穴フィーチャーの投影ルール (JIS B 0001 / ISO 128 準拠):
+  - 穴軸が視線と平行 → 円 (実線 or 隠れ線) ＋ 中心線クロス
+  - 穴軸が視線と直交 → 2本の平行破線 (穴径間隔) ＋ 1本の中心線 (一点鎖線)
+    線の長さは穴深さ (= 壁厚、貫通穴の場合)
 
 外部 API・ライブラリは不要。Python 標準ライブラリのみ使用。
 
@@ -12,14 +17,13 @@ requirements.json または parameters.json から
   python stage2_svg_views.py --params parameters.json --out views/
   python stage2_svg_views.py --req requirements.json --params parameters.json --out views/
 
-  ※ --req と --params を両方渡すと parameters.json の値が優先される（より精確）
-
 出力:
   views/technical_drawing.svg  ← ブラウザで直接開ける
 """
 
 import json
 import math
+import re
 import sys
 import os
 import argparse
@@ -28,7 +32,7 @@ from pathlib import Path
 
 # ── 定数 ──────────────────────────────────────────────────────────────────────
 CANVAS_W = 1400
-CANVAS_H = 1000
+CANVAS_H = 950
 PADDING  = 50
 TITLE_H  = 80
 VIEW_GAP = 65          # ビュー間の余白 (px)
@@ -36,25 +40,30 @@ VIEW_GAP = 65          # ビュー間の余白 (px)
 # 色
 COLOR_OUTLINE    = "#1a1a2e"   # 外形線（濃い紺）
 COLOR_HIDDEN     = "#888888"   # 隠れ線（破線）
-COLOR_CENTERLINE = "#cc3333"   # 中心線
+COLOR_CENTERLINE = "#cc3333"   # 中心線（一点鎖線）
 COLOR_DIM        = "#1a5fb4"   # 寸法線・テキスト
 COLOR_LABEL      = "#222222"   # ビュー名
 COLOR_BG         = "#ffffff"
 COLOR_FACE_FRONT = "#eef1f8"   # 正面の面色
-COLOR_FACE_TOP   = "#f4f6fb"   # 上面の面色
+COLOR_FACE_TOP   = "#f4f6fb"   # 上面の面色（底面図でも使用）
 COLOR_FACE_SIDE  = "#dde2f0"   # 側面の面色
 COLOR_TITLE_BG   = "#1a1a2e"
 COLOR_TITLE_TEXT = "#ffffff"
 COLOR_SUBTITLE   = "#9999cc"
+COLOR_FEATURE    = "#2d6a4f"   # フィーチャー穴（緑系、実線）
+COLOR_FEATURE_HIDDEN = "#888888"  # フィーチャー穴（隠れ線）
+COLOR_FEAT_LABEL = "#2d6a4f"   # フィーチャーラベル
 
 FONT = "Noto Sans JP, Meiryo, Yu Gothic, Arial, sans-serif"
 
-ARROW_LEN  = 9    # 矢印の長さ (px)
-ARROW_W    = 3.5  # 矢印の幅 (px)
-DIM_OFFSET = 22   # 外形線から寸法線までのオフセット (px)
-EXT_MARGIN = 6    # 延長線の余白 (px)
-LABEL_SIZE = 12   # 寸法値テキストサイズ
-VIEW_TITLE = 14   # ビュー名テキストサイズ
+ARROW_LEN  = 9
+ARROW_W    = 3.5
+DIM_OFFSET = 22
+EXT_MARGIN = 6
+LABEL_SIZE = 12
+VIEW_TITLE = 14
+FEAT_LABEL_SIZE = 9
+CL_MARGIN  = 4   # 中心線の線端余白 (px)
 
 
 # ── SVGBuilder ────────────────────────────────────────────────────────────────
@@ -153,13 +162,67 @@ class SVGBuilder:
         self.text_rotated(x_dim, my, label, -90, size=LABEL_SIZE, color=COLOR_DIM)
 
     def center_cross(self, cx, cy, size=10):
+        """中心線クロス（穴を正面から見たとき）"""
         self.line(cx - size, cy, cx + size, cy,
-                  stroke=COLOR_CENTERLINE, sw=0.7, dash="5,3")
+                  stroke=COLOR_CENTERLINE, sw=0.7, dash="8,3,2,3")
         self.line(cx, cy - size, cx, cy + size,
-                  stroke=COLOR_CENTERLINE, sw=0.7, dash="5,3")
+                  stroke=COLOR_CENTERLINE, sw=0.7, dash="8,3,2,3")
 
     def view_title(self, cx, y, label):
         self.text(cx, y, label, size=VIEW_TITLE, color=COLOR_LABEL, bold=True)
+
+    # ── フィーチャー描画プリミティブ ──
+
+    def feature_circle(self, cx, cy, r, hidden=False):
+        """穴を軸方向から見た投影: 円＋中心線クロス"""
+        if hidden:
+            self.circle(cx, cy, r, stroke=COLOR_FEATURE_HIDDEN, sw=0.8, dash="4,2")
+            # 隠れ穴でも中心線は描く（やや薄く）
+            self.center_cross(cx, cy, max(r + 4, 8))
+        else:
+            self.circle(cx, cy, r, stroke=COLOR_FEATURE, sw=1.2)
+            self.center_cross(cx, cy, max(r + 4, 8))
+
+    def feature_side_h(self, cy, r, x_start, x_end, hidden=True):
+        """穴を側面から見た投影（穴軸が水平方向）:
+        2本の水平平行破線（穴径間隔）＋ 水平中心線（一点鎖線）
+
+        cy:      穴中心の Y 座標 (px)
+        r:       穴半径 (px)
+        x_start: 穴始端の X 座標 (px) — 面の外縁
+        x_end:   穴終端の X 座標 (px) — 壁厚だけ内側
+        """
+        stroke = COLOR_FEATURE_HIDDEN if hidden else COLOR_FEATURE
+        dash   = "4,2"
+        # 2本の平行破線
+        self.line(x_start, cy - r, x_end, cy - r, stroke=stroke, sw=0.8, dash=dash)
+        self.line(x_start, cy + r, x_end, cy + r, stroke=stroke, sw=0.8, dash=dash)
+        # 中心線（一点鎖線）— 両端を少しはみ出す
+        self.line(min(x_start, x_end) - CL_MARGIN, cy,
+                  max(x_start, x_end) + CL_MARGIN, cy,
+                  stroke=COLOR_CENTERLINE, sw=0.5, dash="8,3,2,3")
+
+    def feature_side_v(self, cx, r, y_start, y_end, hidden=True):
+        """穴を側面から見た投影（穴軸が垂直方向）:
+        2本の垂直平行破線（穴径間隔）＋ 垂直中心線（一点鎖線）
+
+        cx:      穴中心の X 座標 (px)
+        r:       穴半径 (px)
+        y_start: 穴始端の Y 座標 (px) — 面の外縁
+        y_end:   穴終端の Y 座標 (px) — 壁厚だけ内側
+        """
+        stroke = COLOR_FEATURE_HIDDEN if hidden else COLOR_FEATURE
+        dash   = "4,2"
+        self.line(cx - r, y_start, cx - r, y_end, stroke=stroke, sw=0.8, dash=dash)
+        self.line(cx + r, y_start, cx + r, y_end, stroke=stroke, sw=0.8, dash=dash)
+        self.line(cx, min(y_start, y_end) - CL_MARGIN,
+                  cx, max(y_start, y_end) + CL_MARGIN,
+                  stroke=COLOR_CENTERLINE, sw=0.5, dash="8,3,2,3")
+
+    def feature_label(self, x, y, label, offset_x=0, offset_y=-12):
+        """フィーチャーラベルを描画"""
+        self.text(x + offset_x, y + offset_y, label,
+                  size=FEAT_LABEL_SIZE, color=COLOR_FEAT_LABEL, anchor="middle")
 
     def build(self):
         body = "\n".join(self._elems)
@@ -173,14 +236,138 @@ class SVGBuilder:
         )
 
 
-# ── 等角投影 ──────────────────────────────────────────────────────────────────
+# ── インターフェース解析 ─────────────────────────────────────────────────────
+# (v2 から変更なし)
 
-def iso_pt(x, y, z, scale, ox, oy):
-    cos30 = math.cos(math.radians(30))
-    sin30 = math.sin(math.radians(30))
-    sx =  (x - z) * cos30 * scale + ox
-    sy = -(y - (x + z) * sin30) * scale + oy
-    return sx, sy
+def _parse_number(text, pattern):
+    m = re.search(pattern, text)
+    return float(m.group(1)) if m else None
+
+
+def _classify_face(iface):
+    pos = iface.get("position", "").lower()
+    itype = iface.get("type", "").lower()
+    spec = iface.get("spec", "").lower()
+    if "front" in pos:
+        return "front"
+    if "back" in pos or "背面" in pos:
+        if "bottom" in pos:
+            return "bottom"
+        return "back"
+    if "bottom" in pos or "底面" in pos:
+        return "bottom"
+    if "top" in pos or "上面" in pos:
+        return "top"
+    if "left" in pos or "right" in pos or "側面" in pos:
+        return "side"
+    if itype == "mounting_hole" and ("背面" in spec or "壁" in spec):
+        return "back"
+    if itype == "screw_boss":
+        return "front"
+    return "front"
+
+
+def _resolve_hole_positions(iface, face, W, H, D, wall):
+    dia = float(iface.get("hole_diameter_mm", 5.0))
+    spec = iface.get("spec", "")
+    name = iface.get("name", "")
+    pos  = iface.get("position", "")
+    itype = iface.get("type", "")
+    label = _make_label(name, dia, itype)
+    results = []
+    spacing_str = iface.get("spacing", "")
+
+    if face == "back" and (spacing_str or itype == "mounting_hole"):
+        sw = sh = None
+        if spacing_str:
+            nums = re.findall(r'(\d+\.?\d*)mm', spacing_str)
+            if len(nums) >= 2:
+                sw, sh = float(nums[0]), float(nums[1])
+        edge = _parse_number(spec, r'端から(\d+\.?\d*)mm') or 6.0
+        if sw and sh:
+            cx, cy = W / 2, H / 2
+            for dx in (-sw/2, sw/2):
+                for dy in (-sh/2, sh/2):
+                    results.append((face, cx + dx, cy + dy, dia, label))
+            return results
+        for x in (edge, W - edge):
+            for y in (edge, H - edge):
+                results.append((face, x, y, dia, label))
+        return results
+
+    if face == "front" and itype == "screw_boss":
+        offset = _parse_number(spec, r'(\d+\.?\d*)mm.*内側') or 10.0
+        for x in (offset, W - offset):
+            for y in (offset, H - offset):
+                results.append((face, x, y, dia, label))
+        return results
+
+    if face == "bottom":
+        num_m = re.search(r'[×x]\s*(\d+)', name)
+        num_holes = int(num_m.group(1)) if num_m else None
+        if num_holes is None:
+            num_m2 = re.search(r'(\d+)\s*個', spec)
+            num_holes = int(num_m2.group(1)) if num_m2 else 1
+        center_dist = _parse_number(spec, r'中心間距離\s*(\d+\.?\d*)mm')
+        cx = W / 2
+        if "rear" in pos.lower() or "奥" in spec or "背面寄り" in spec:
+            cy = D * 0.75
+        elif "front" in pos.lower() or "前" in spec:
+            cy = D * 0.25
+        else:
+            cy = D / 2
+        if center_dist and num_holes >= 2:
+            for i in range(num_holes):
+                off = center_dist * (i - (num_holes - 1) / 2)
+                results.append((face, cx + off, cy, dia, label))
+        else:
+            if num_holes >= 2:
+                # center_dist 未指定: 同一座標への重複追加を防ぎ、幅方向に均等配置
+                print(f"⚠️ WARN: '{name}' の中心間距離が未指定。"
+                      f"幅方向に均等配置します（要確認: requirements.json に spacing を追加推奨）")
+                spacing_fallback = W * 0.5
+                for i in range(num_holes):
+                    off = spacing_fallback * (i - (num_holes - 1) / 2)
+                    results.append((face, cx + off, cy, dia, label))
+            else:
+                results.append((face, cx, cy, dia, label))
+        return results
+
+    if face == "front" and itype in ("through_hole", "led"):
+        combined = pos + " " + spec
+        x = _parse_number(combined, r'[wW][=＝]?\s*(\d+\.?\d*)mm')
+        if x is None or "中央" in combined:
+            x = W / 2
+        y = _parse_number(combined, r'[hH上].*?(\d+\.?\d*)mm')
+        if y is None:
+            y = H / 2
+        results.append((face, x, y, dia, label))
+        return results
+
+    if face in ("front", "back"):
+        results.append((face, W / 2, H / 2, dia, label))
+    elif face in ("bottom", "top"):
+        results.append((face, W / 2, D / 2, dia, label))
+    elif face == "side":
+        results.append((face, D / 2, H / 2, dia, label))
+    else:
+        results.append((face, W / 2, H / 2, dia, label))
+    return results
+
+
+def _make_label(name, dia, itype):
+    n = name.lower()
+    if "pg7" in n or "ケーブルグランド" in n:
+        return "PG7"
+    if "led" in n:
+        return f"φ{dia:.1f} LED"
+    if "ベント" in n or "vent" in n:
+        return f"φ{dia:.0f} VENT"
+    if "壁面" in n or "wall" in n or ("mounting" in itype):
+        return "M4 取付"
+    if "ヒートセット" in n or "インサート" in n or "screw_boss" in itype:
+        return "M3 ins."
+    return f"φ{dia:.1f}"
 
 
 # ── 寸法データ抽出 ────────────────────────────────────────────────────────────
@@ -194,8 +381,7 @@ def extract_dims(req: dict, params: dict) -> dict:
         "wall":     2.0,
         "fillet":   1.5,
         "mfg_method": "",
-        "mounting_holes": [],
-        "cable_holes":    [],
+        "features": [],
         "pcb": None,
     }
 
@@ -205,37 +391,33 @@ def extract_dims(req: dict, params: dict) -> dict:
         d["width"]  = float(outer.get("width_mm",  d["width"]))
         d["height"] = float(outer.get("height_mm", d["height"]))
         d["depth"]  = float(outer.get("depth_mm",  d["depth"]))
+        d["wall"]   = float(req.get("dimensions", {}).get("wall_thickness_mm", d["wall"]))
         d["mfg_method"] = req.get("manufacturing", {}).get("method", "")
+
+        W, H, D, wall = d["width"], d["height"], d["depth"], d["wall"]
+        for iface in req.get("interfaces", []):
+            face = _classify_face(iface)
+            holes = _resolve_hole_positions(iface, face, W, H, D, wall)
+            d["features"].extend(holes)
+
+        for comp in req.get("internal_components", []):
+            dims_str = comp.get("dimensions", "")
+            nums = re.findall(r'(\d+\.?\d*)mm', dims_str)
+            if len(nums) >= 2:
+                d["pcb"] = {"w": float(nums[0]), "d": float(nums[1]),
+                            "h_standoff": float(nums[2]) if len(nums) >= 3 else 5.0,
+                            "label": comp.get("name", "PCB")}
+                break
 
     if params:
         def vp(section, key):
             s = params.get(section, {})
             return float(s[key]["value"]) if key in s else None
-
         d["width"]  = vp("outer_envelope", "width")  or d["width"]
         d["depth"]  = vp("outer_envelope", "depth")  or d["depth"]
         d["height"] = vp("outer_envelope", "height") or d["height"]
         d["wall"]   = vp("global", "wall_thickness") or d["wall"]
         d["fillet"] = vp("global", "fillet_radius")  or d["fillet"]
-
-        px = vp("mounting_interface", "bolt_hole_pitch_x")
-        py = vp("mounting_interface", "bolt_hole_pitch_y")
-        bd = vp("mounting_interface", "bolt_hole_diameter")
-        if px and py and bd:
-            cx, cy = d["width"] / 2, d["depth"] / 2
-            r = bd / 2
-            d["mounting_holes"] = [
-                (cx - px/2, cy - py/2, r),
-                (cx + px/2, cy - py/2, r),
-                (cx - px/2, cy + py/2, r),
-                (cx + px/2, cy + py/2, r),
-            ]
-
-        cd = vp("openings", "cable_hole_diameter")
-        cz = vp("openings", "cable_hole_offset_z") or d["height"] / 2
-        if cd:
-            d["cable_holes"] = [("left", cz, cd / 2)]
-
         pw = vp("internal_cavity", "pcb_width")
         pd = vp("internal_cavity", "pcb_depth")
         ph = vp("internal_cavity", "pcb_standoff_height")
@@ -245,124 +427,221 @@ def extract_dims(req: dict, params: dict) -> dict:
     return d
 
 
+# ── ラベル重複防止ヘルパー ────────────────────────────────────────────────────
+
+def _label_key(label, px, py, grid=20):
+    return f"{label}_{round(px/grid)}_{round(py/grid)}"
+
+
 # ── 各ビューの描画 ────────────────────────────────────────────────────────────
+#
+#  3D 座標系:  X = 左→右 (0..W)
+#              Y = 上→下 (0..H)   ← 図面の上が上
+#              Z = 手前→奥 (0..D)
+#
+#  穴の軸方向:
+#    front 面 (z=0) → 軸 +Z     back 面 (z=D) → 軸 -Z
+#    bottom面 (y=H) → 軸 -Y     top 面 (y=0)  → 軸 +Y
+#    side 面        → 軸 ±X
+#
+#  投影ルール:
+#    軸 ∥ 視線 → 円 (実線 or 隠れ線)
+#    軸 ⊥ 視線 → 2本平行破線 + 中心線 (深さ=壁厚)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def draw_front(svg, d, ox, oy, sc):
-    W, H = d["width"] * sc, d["height"] * sc
-    wall = d["wall"] * sc
-    fr   = d["fillet"] * sc
+    """正面図 — 視線 -Z方向、XY 平面を見る (W × H)"""
+    W  = d["width"]  * sc
+    H  = d["height"] * sc
+    wp = d["wall"]   * sc   # wall in px
+    fr = d["fillet"]  * sc
+
+    # 外形 + 内壁隠れ線
     svg.rect(ox, oy, W, H, fill=COLOR_FACE_FRONT, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
-    svg.rect(ox + wall, oy + wall, W - 2*wall, H - 2*wall,
+    svg.rect(ox + wp, oy + wp, W - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
-             rx=max(0.0, fr - wall))
-    for side, fz, fr_hole in d["cable_holes"]:
-        r = fr_hole * sc
-        hy = oy + H - fz * sc
-        hx = ox + (wall / 2 if side == "left" else W / 2)
-        svg.circle(hx, hy, r, stroke=COLOR_HIDDEN, sw=1.0, dash="4,2")
-        svg.center_cross(hx, hy, r + 6)
+             rx=max(0.0, fr - wp))
+
+    drawn = set()
+    for face, fx, fy, dia, label in d["features"]:
+        r = (dia / 2) * sc
+
+        if face == "front":
+            # 軸 +Z ∥ 視線 → 実線の円
+            cx, cy = ox + fx * sc, oy + fy * sc
+            svg.feature_circle(cx, cy, r, hidden=False)
+            k = _label_key(label, cx, cy)
+            if k not in drawn:
+                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
+                drawn.add(k)
+
+        elif face == "back":
+            # 軸 -Z ∥ 視線 (裏側) → 隠れ線の円
+            cx, cy = ox + fx * sc, oy + fy * sc
+            svg.feature_circle(cx, cy, r, hidden=True)
+            k = _label_key(label, cx, cy)
+            if k not in drawn:
+                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
+                drawn.add(k)
+
+        elif face == "bottom":
+            # 軸 -Y ⊥ 視線 → 2本の垂直破線 (底辺から壁厚分)
+            cx = ox + fx * sc
+            svg.feature_side_v(cx, r, oy + H - wp, oy + H, hidden=True)
+            k = _label_key(label, cx, oy + H)
+            if k not in drawn:
+                svg.feature_label(cx, oy + H - wp, label, offset_x=max(r+6, 12), offset_y=-6)
+                drawn.add(k)
+
+        elif face == "top":
+            # 軸 +Y ⊥ 視線 → 2本の垂直破線 (上辺から壁厚分)
+            cx = ox + fx * sc
+            svg.feature_side_v(cx, r, oy, oy + wp, hidden=True)
+
+    # 寸法線
     svg.dim_h(ox, oy, ox + W, f"{d['width']:.0f}", above=True)
     svg.dim_v(oy, ox, oy + H, f"{d['height']:.0f}", left_side=True)
     svg.view_title(ox + W/2, oy + H + 30, "正面図 FRONT VIEW")
 
 
 def draw_side(svg, d, ox, oy, sc):
-    D, H = d["depth"] * sc, d["height"] * sc
-    wall = d["wall"] * sc
-    fr   = d["fillet"] * sc
-    svg.rect(ox, oy, D, H, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
-    svg.rect(ox + wall, oy + wall, D - 2*wall, H - 2*wall,
+    """側面図（右側面）— 視線 -X方向、ZY 平面を見る (D × H)
+       u 軸 = Z (手前→奥 = 左→右)、v 軸 = Y (上→下)
+    """
+    Dp = d["depth"]  * sc
+    H  = d["height"] * sc
+    wp = d["wall"]   * sc
+    fr = d["fillet"]  * sc
+
+    svg.rect(ox, oy, Dp, H, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
+    svg.rect(ox + wp, oy + wp, Dp - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
-             rx=max(0.0, fr - wall))
-    for side, fz, fr_hole in d["cable_holes"]:
-        if side == "left":
-            r = fr_hole * sc
-            hy = oy + H - fz * sc
-            hx = ox + wall / 2
-            svg.circle(hx, hy, r, stroke=COLOR_OUTLINE, sw=1.0)
-            svg.center_cross(hx, hy, r + 6)
-    svg.dim_h(ox, oy, ox + D, f"{d['depth']:.0f}", above=True)
-    svg.dim_v(oy, ox + D, oy + H, f"{d['height']:.0f}", left_side=False)
-    svg.view_title(ox + D/2, oy + H + 30, "側面図 SIDE VIEW")
+             rx=max(0.0, fr - wp))
+
+    drawn = set()
+    for face, fx, fy, dia, label in d["features"]:
+        r = (dia / 2) * sc
+
+        if face == "front":
+            # 軸 +Z ⊥ 視線 → 2本の水平破線（前面=左端から壁厚分）
+            cy = oy + fy * sc
+            svg.feature_side_h(cy, r, ox, ox + wp, hidden=True)
+            k = _label_key(label, ox, cy)
+            if k not in drawn:
+                svg.feature_label(ox + wp + 4, cy, label, offset_x=12, offset_y=-max(r+3, 8))
+                drawn.add(k)
+
+        elif face == "back":
+            # 軸 -Z ⊥ 視線 → 2本の水平破線（背面=右端から壁厚分）
+            cy = oy + fy * sc
+            svg.feature_side_h(cy, r, ox + Dp - wp, ox + Dp, hidden=True)
+            k = _label_key(label, ox + Dp, cy)
+            if k not in drawn:
+                svg.feature_label(ox + Dp - wp - 4, cy, label, offset_x=-12, offset_y=-max(r+3, 8))
+                drawn.add(k)
+
+        elif face == "bottom":
+            # 軸 -Y ⊥ 視線 → 2本の垂直破線（底辺から壁厚分）
+            # fy は底面上の depth 方向座標 → 側面図の u 座標
+            cu = ox + fy * sc
+            svg.feature_side_v(cu, r, oy + H - wp, oy + H, hidden=True)
+            k = _label_key(label, cu, oy + H)
+            if k not in drawn:
+                svg.feature_label(cu, oy + H - wp, label, offset_x=max(r+6, 10), offset_y=-6)
+                drawn.add(k)
+
+        elif face == "side":
+            # 軸 ±X ∥ 視線 → 円
+            cx, cy = ox + fx * sc, oy + fy * sc
+            svg.feature_circle(cx, cy, r, hidden=False)
+
+    svg.dim_h(ox, oy, ox + Dp, f"{d['depth']:.0f}", above=True)
+    svg.dim_v(oy, ox + Dp, oy + H, f"{d['height']:.0f}", left_side=False)
+    svg.view_title(ox + Dp/2, oy + H + 30, "側面図 SIDE VIEW")
 
 
-def draw_top(svg, d, ox, oy, sc):
-    W, Dp = d["width"] * sc, d["depth"] * sc
-    wall  = d["wall"] * sc
-    fr    = d["fillet"] * sc
+def draw_bottom(svg, d, ox, oy, sc):
+    """底面図 — 視線 +Y方向、XZ 平面を見る (W × D)
+       u 軸 = X (左→右)、v 軸 = Z (手前→奥 = 上→下)
+    """
+    W  = d["width"] * sc
+    Dp = d["depth"] * sc
+    wp = d["wall"]  * sc
+    fr = d["fillet"] * sc
+
     svg.rect(ox, oy, W, Dp, fill=COLOR_FACE_TOP, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
-    svg.rect(ox + wall, oy + wall, W - 2*wall, Dp - 2*wall,
+    svg.rect(ox + wp, oy + wp, W - 2*wp, Dp - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
-             rx=max(0.0, fr - wall))
+             rx=max(0.0, fr - wp))
+
+    # 内蔵部品フットプリント
     if d["pcb"]:
-        pcb_w = d["pcb"]["w"] * sc
-        pcb_d = d["pcb"]["d"] * sc
-        pcb_ox = ox + (W - pcb_w) / 2
-        pcb_oy = oy + (Dp - pcb_d) / 2
-        svg.rect(pcb_ox, pcb_oy, pcb_w, pcb_d,
+        pw = d["pcb"]["w"] * sc
+        pd = d["pcb"]["d"] * sc
+        svg.rect(ox + (W - pw)/2, oy + (Dp - pd)/2, pw, pd,
                  fill="none", stroke="#4477aa", sw=0.8, dash="3,3")
-    for hx, hy, hr in d["mounting_holes"]:
-        sx, sy, sr = ox + hx * sc, oy + hy * sc, hr * sc
-        svg.circle(sx, sy, sr, fill="none", stroke=COLOR_OUTLINE, sw=1.2)
-        svg.center_cross(sx, sy, sr + 6)
-    mh = d["mounting_holes"]
-    if len(mh) >= 2:
-        px_mm = abs(mh[1][0] - mh[0][0])
-        svg.dim_h(ox + mh[0][0]*sc, oy - 5,
-                  ox + mh[1][0]*sc, f"P.C.D {px_mm:.0f}", above=True)
-    if len(mh) >= 3:
-        py_mm = abs(mh[2][1] - mh[0][1])
-        svg.dim_v(oy + mh[0][1]*sc, ox - 5,
-                  oy + mh[2][1]*sc, f"P.C.D {py_mm:.0f}", left_side=True)
-    svg.dim_h(ox, oy + Dp, ox + W, f"{d['width']:.0f}", above=False)
+        pcb_label = d["pcb"].get("label", "PCB")
+        svg.text(ox + W/2, oy + Dp/2, pcb_label, size=8, color="#4477aa")
+
+    drawn = set()
+    for face, fx, fy, dia, label in d["features"]:
+        r = (dia / 2) * sc
+
+        if face == "bottom":
+            # 軸 -Y ∥ 視線 → 実線の円
+            cx, cy = ox + fx * sc, oy + fy * sc
+            svg.feature_circle(cx, cy, r, hidden=False)
+            k = _label_key(label, cx, cy)
+            if k not in drawn:
+                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
+                drawn.add(k)
+
+        elif face == "top":
+            # 軸 +Y ∥ 視線 (裏側) → 隠れ線の円
+            cx, cy = ox + fx * sc, oy + fy * sc
+            svg.feature_circle(cx, cy, r, hidden=True)
+
+        elif face == "front":
+            # 軸 +Z ⊥ 視線 → 2本の水平破線（前端=上端から壁厚分）
+            # front 穴は (fx, fy) = (X座標, Y/高さ座標)。底面図では X が u。
+            cu = ox + fx * sc
+            svg.feature_side_v(cu, r, oy, oy + wp, hidden=True)
+            k = _label_key(label, cu, oy)
+            if k not in drawn:
+                svg.feature_label(cu, oy + wp, label, offset_x=max(r+6, 12), offset_y=10)
+                drawn.add(k)
+
+        elif face == "back":
+            # 軸 -Z ⊥ 視線 → 2本の垂直破線（背面端=下端から壁厚分）
+            cu = ox + fx * sc
+            svg.feature_side_v(cu, r, oy + Dp - wp, oy + Dp, hidden=True)
+            k = _label_key(label, cu, oy + Dp)
+            if k not in drawn:
+                svg.feature_label(cu, oy + Dp - wp, label, offset_x=max(r+6, 12), offset_y=-6)
+                drawn.add(k)
+
+    # 底面穴グループ間隔寸法
+    bottom_feats = [(fx, fy) for f, fx, fy, dia, lbl in d["features"] if f == "bottom"]
+    if len(bottom_feats) >= 2:
+        xs = sorted(set(round(fx, 2) for fx, fy in bottom_feats))
+        if len(xs) >= 2:
+            svg.dim_h(ox + xs[0]*sc, oy + Dp + 5,
+                      ox + xs[-1]*sc, f"{xs[-1]-xs[0]:.0f}", above=False)
+
+    # 背面取付穴ピッチ寸法
+    back_feats = [(fx, fy) for f, fx, fy, dia, lbl in d["features"] if f == "back"]
+    if len(back_feats) >= 2:
+        bxs = sorted(set(round(fx, 2) for fx, fy in back_feats))
+        if len(bxs) >= 2:
+            svg.dim_h(ox + bxs[0]*sc, oy - 5,
+                      ox + bxs[-1]*sc, f"P.C.D {bxs[-1]-bxs[0]:.0f}", above=True)
+
+    # 外形寸法
+    svg.dim_h(ox, oy + Dp + 28, ox + W, f"{d['width']:.0f}", above=False)
     svg.dim_v(oy, ox + W, oy + Dp, f"{d['depth']:.0f}", left_side=False)
-    svg.view_title(ox + W/2, oy - 22, "上面図 TOP VIEW")
+    svg.view_title(ox + W/2, oy - 22, "底面図 BOTTOM VIEW")
 
 
-def draw_isometric(svg, d, cx, cy, sc):
-    W, D, H = d["width"], d["depth"], d["height"]
-    iso_sc = sc * 0.65
-
-    def pt(x, y, z):
-        return iso_pt(x, y, z, iso_sc, cx, cy)
-
-    c = {
-        "fbl": pt(0, 0, 0), "fbr": pt(W, 0, 0),
-        "ftr": pt(W, H, 0), "ftl": pt(0, H, 0),
-        "bbl": pt(0, 0, D), "bbr": pt(W, 0, D),
-        "btr": pt(W, H, D), "btl": pt(0, H, D),
-    }
-    svg.polygon([c["ftl"], c["ftr"], c["btr"], c["btl"]],
-                fill=COLOR_FACE_TOP,  stroke=COLOR_OUTLINE, sw=1.5)
-    svg.polygon([c["fbl"], c["fbr"], c["ftr"], c["ftl"]],
-                fill=COLOR_FACE_FRONT, stroke=COLOR_OUTLINE, sw=1.5)
-    svg.polygon([c["fbr"], c["bbr"], c["btr"], c["ftr"]],
-                fill=COLOR_FACE_SIDE,  stroke=COLOR_OUTLINE, sw=1.5)
-    for p, q in [
-        (c["fbl"], c["fbr"]), (c["fbr"], c["ftr"]),
-        (c["ftr"], c["ftl"]), (c["ftl"], c["fbl"]),
-        (c["fbl"], c["bbl"]), (c["fbr"], c["bbr"]),
-        (c["bbl"], c["bbr"]), (c["bbr"], c["btr"]),
-        (c["btr"], c["btl"]), (c["btl"], c["ftl"]),
-        (c["ftr"], c["btr"]),
-    ]:
-        svg.line(*p, *q, stroke=COLOR_OUTLINE, sw=2.0)
-    for hx, hy, hr in d["mounting_holes"]:
-        hp = pt(hx, H, hy)
-        svg.circle(*hp, hr * iso_sc * 0.85, fill="#ccccdd", stroke=COLOR_OUTLINE, sw=0.8)
-        svg.center_cross(*hp, hr * iso_sc * 1.6)
-    dc = COLOR_DIM
-    wb, we = pt(0, -6, 0), pt(W, -6, 0)
-    svg.line(*wb, *we, stroke=dc, sw=0.8)
-    svg.text((wb[0]+we[0])/2, (wb[1]+we[1])/2 - 9, f"W {W:.0f}", size=11, color=dc)
-    hl, ht = pt(-5, 0, 0), pt(-5, H, 0)
-    svg.line(*hl, *ht, stroke=dc, sw=0.8)
-    svg.text((hl[0]+ht[0])/2 - 14, (hl[1]+ht[1])/2, f"H {H:.0f}", size=11, color=dc)
-    df_, db = pt(W+5, 0, 0), pt(W+5, 0, D)
-    svg.line(*df_, *db, stroke=dc, sw=0.8)
-    svg.text((df_[0]+db[0])/2 + 15, (df_[1]+db[1])/2, f"D {D:.0f}", size=11, color=dc)
-    bottom_pt = pt(W/2, 0, D)
-    svg.view_title(cx, bottom_pt[1] + 28, "等角図 ISOMETRIC VIEW")
 
 
 def draw_title_block(svg, d, cw, ch, pad, th):
@@ -374,6 +653,9 @@ def draw_title_block(svg, d, cw, ch, pad, th):
     info = f"W{d['width']:.0f} x D{d['depth']:.0f} x H{d['height']:.0f} mm"
     if d["mfg_method"]:
         info += f"  |  {d['mfg_method']}"
+    n_feat = len(d["features"])
+    if n_feat > 0:
+        info += f"  |  interfaces: {n_feat} holes"
     svg.text(pad + 24, ty + th * 0.72, info,
              size=13, color=COLOR_SUBTITLE, anchor="start")
     today = date.today().strftime("%Y-%m-%d")
@@ -381,7 +663,7 @@ def draw_title_block(svg, d, cw, ch, pad, th):
              "技術図面 / TECHNICAL DRAWING",
              size=14, color=COLOR_SUBTITLE, anchor="end")
     svg.text(pad + tw - 24, ty + th * 0.72,
-             f"作成日: {today}  |  text-to-cad skill",
+             f"作成日: {today}  |  text-to-cad skill v4",
              size=11, color=COLOR_SUBTITLE, anchor="end")
 
 
@@ -399,30 +681,33 @@ def generate_svg(req_data, param_data, output_path):
     da_h = CANVAS_H - PADDING * 2 - TITLE_H
     svg.rect(da_x, da_y, da_w, da_h, fill="#f9f9fd", stroke="#ccccdd", sw=1.0, rx=4)
 
-    left_w    = da_w * 0.60
+    left_w    = da_w       # 3面図で全幅を使う
     inner_pad = PADDING * 1.2
-    max_sc_x  = (left_w - VIEW_GAP - inner_pad * 2) / (W + D)
-    max_sc_y  = (da_h   - VIEW_GAP - inner_pad * 3) / (D + H)
+    max_sc_x  = (da_w - VIEW_GAP - inner_pad * 2) / (W + D)
+    max_sc_y  = (da_h - VIEW_GAP - inner_pad * 3) / (D + H)
     sc = min(max_sc_x, max_sc_y, 5.0)
 
     v_ox, v_oy = da_x + inner_pad, da_y + inner_pad
-
-    top_ox,   top_oy   = v_ox,                   v_oy
+    plan_ox,  plan_oy  = v_ox,                   v_oy
     front_ox, front_oy = v_ox,                   v_oy + D*sc + VIEW_GAP
     side_ox,  side_oy  = v_ox + W*sc + VIEW_GAP, front_oy
 
-    iso_cx = da_x + left_w + (da_w - left_w) * 0.5
-    iso_cy = da_y + da_h * 0.42
-
-    draw_top(svg, d, top_ox, top_oy, sc)
+    draw_bottom(svg, d, plan_ox, plan_oy, sc)
     draw_front(svg, d, front_ox, front_oy, sc)
     draw_side(svg, d, side_ox, side_oy, sc)
-    draw_isometric(svg, d, iso_cx, iso_cy, sc)
 
     svg.text(da_x + 10, da_y + da_h - 12,
              "第三角法 / Third-angle projection",
              size=10, color="#aaaaaa", anchor="start", italic=True)
     draw_title_block(svg, d, CANVAS_W, CANVAS_H, PADDING, TITLE_H)
+
+    # フィーチャーサマリ
+    faces = {}
+    for face, fx, fy, dia, label in d["features"]:
+        faces.setdefault(face, []).append(label)
+    print("📊 フィーチャー解析結果:")
+    for face, labels in faces.items():
+        print(f"   {face}: {', '.join(labels)} ({len(labels)}個)")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)

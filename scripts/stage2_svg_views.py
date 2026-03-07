@@ -284,10 +284,12 @@ def _resolve_hole_positions(iface, face, W, H, D, wall):
             if len(nums) >= 2:
                 sw, sh = float(nums[0]), float(nums[1])
         edge = _parse_number(spec, r'端から(\d+\.?\d*)mm') or 6.0
-        if sw and sh:
+        if sw is not None and sh is not None:
             cx, cy = W / 2, H / 2
-            for dx in (-sw/2, sw/2):
-                for dy in (-sh/2, sh/2):
+            dxs = [-sw/2, sw/2] if sw > 0.001 else [0]
+            dys = [-sh/2, sh/2] if sh > 0.001 else [0]
+            for dx in dxs:
+                for dy in dys:
                     results.append((face, cx + dx, cy + dy, dia, label))
             return results
         for x in (edge, W - edge):

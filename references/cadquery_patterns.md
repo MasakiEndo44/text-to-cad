@@ -297,18 +297,26 @@ cq.exporters.export(bracket, "bracket_L.step")
 
 ---
 
-## 統合ビルドテンプレート（最重要）
+## 統合ビルドテンプレート（最重要） — geometry_tree 駆動
 
-個別パターンを組み合わせて1つの部品を作る際の**標準手順**。
-Stage 3.5 の `feature_mapping.json` に従い、以下の順序でコードを組み立てる。
+`feature_mapping.json` の `geometry_tree` + `finishing` + `features` からコードを組み立てる標準手順。
+コードは3フェーズで構成する。
 
 ### なぜ順序が重要か
 
 CadQuery/OpenCASCADE は操作ごとに面・エッジの構成が変わる。
 特に `shell()` と `union()` の後は、面セレクタ（`>Z` 等）が拾う面が変わる。
-**面に対する加工（穴・ポケット）は、その面が最終形状になった後に行う。**
+**外形の構築（union）→ 仕上げ（fillet/shell）→ 加工（穴/ボス）の順序を厳守する。**
 
-### box_shell 型のビルド手順
+### 3フェーズ構成
+
+```
+Phase A: 構造構築 — geometry_tree のプリミティブを生成し Boolean 合体
+Phase B: 仕上げ   — fillet → shell（順序厳守）
+Phase C: フィーチャー — 穴・ボス・溝（build_order 順）
+```
+
+### 基本テンプレート（耳付き box_shell の例）
 
 ```python
 import cadquery as cq
@@ -327,70 +335,96 @@ W = p("outer_envelope", "width")
 D = p("outer_envelope", "depth")
 H = p("outer_envelope", "height")
 wall = p("global", "wall_thickness")
+fr = p("global", "fillet_radius")
 
-# ── Step 1: ベース形状 (build_order: 1) ──
+# ══════════════════════════════════════════════════════
+# Phase A: 構造構築（geometry_tree → CadQuery）
+# ══════════════════════════════════════════════════════
+
+# geometry_tree.children[0] | semantic: main_body
 body = cq.Workplane("XY").box(W, D, H)
 
-# ── Step 2: 外周フィレット (build_order: 2) ──
-# ⚠️ shell の前にフィレット！
-body = body.edges("|Z").fillet(p("global", "fillet_radius"))
+# geometry_tree.children[1..4] | semantic: mounting_ear_*
+# 耳を別 body として生成し union
+ear_positions = [(-41, 24, 32.5), (41, 24, 32.5),
+                 (-41, 24, -32.5), (41, 24, -32.5)]
+ear_w, ear_d, ear_h = 14, 3, 14
 
-# ── Step 3: シェル化 (build_order: 3) ──
-body = body.faces(">Z").shell(-wall)
+for pos in ear_positions:
+    ear = cq.Workplane("XY").box(ear_w, ear_d, ear_h)
+    ear = ear.translate(pos)
+    body = body.union(ear)
 
-# ── Step 4+: 各面のフィーチャー (build_order: 4〜) ──
-# feature_mapping.json の build_order 順に実行
+# ── Phase A 中間検証 ──
+bb = body.val().BoundingBox()
+print(f"[CHECK] Phase A BB: {bb.xlen:.1f} x {bb.ylen:.1f} x {bb.zlen:.1f}")
+cq.exporters.export(body, "preview/P001_phase_a.svg",
+    exportType=cq.exporters.ExportTypes.SVG, opt={"width": 400, "height": 300})
 
-# feature: PG7_left | face: -Z
+# ══════════════════════════════════════════════════════
+# Phase B: 仕上げ（finishing: fillet → shell）
+# ══════════════════════════════════════════════════════
+
+# finishing.fillet
+body = body.edges("|Y").fillet(fr)
+
+# finishing.shell | open_face: -Y
+body = body.faces("<Y").shell(-wall)
+
+# ── Phase B 中間検証 ──
+bb = body.val().BoundingBox()
+print(f"[CHECK] Phase B BB: {bb.xlen:.1f} x {bb.ylen:.1f} x {bb.zlen:.1f}")
+
+# ══════════════════════════════════════════════════════
+# Phase C: フィーチャー適用（features 配列 build_order 順）
+# ══════════════════════════════════════════════════════
+
+# feature: pg7_hole_left | face: -Z
 body = (
     body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
-    .center(-15, 5)
+    .center(-15, 0)
     .hole(12.5)
 )
 
-# feature: PG7_right | face: -Z
+# feature: pg7_hole_right | face: -Z
 body = (
     body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
-    .center(15, 5)
+    .center(15, 0)
     .hole(12.5)
 )
 
-# ── Step N: ボス・スタンドオフ ──
-# shell 後の内底面は offset workplane で取得
-# ⚠️ .faces("<Z[-2]") は不安定！offset 方式を使う
-
-# feature: M3_boss_array | face: inner_bottom
-wp = body.faces("<Z").workplane(offset=wall)
+# feature: M3_boss_array | face: inner_back | extrude_direction: inward
+# shell 後の内面は offset workplane で取得
+# ⚠️ .faces("<Y[-2]") は不安定！offset 方式を使う
+wp = body.faces(">Y").workplane(offset=-wall, centerOption="CenterOfBoundBox")
 body = (
-    wp.pushPoints([(27, 34.5), (-27, 34.5), (27, -34.5), (-27, -34.5)])
-    .circle(4).extrude(H - wall - 5)  # 蓋嵌合面近くまで
+    wp.pushPoints([(-29, 32.5), (29, 32.5), (-29, -32.5), (29, -32.5)])
+    .circle(4).extrude(-42)  # inward = workplane法線と逆方向
 )
 
-# ── Step N+1: 追加形状 (耳等) ──
-# union 後の穴あけに注意
-
-# feature: mounting_ear_top | face: +Y
-ear = (
-    cq.Workplane("XY")
-    .workplane(offset=-H/2 + wall/2)
-    .center(0, D/2 + 7.5)
-    .box(W, 15, wall)
-)
-body = body.union(ear)
-
-# feature: M4_mount_top | face: +Y (耳上)
+# feature: mount_holes_on_ears | face: +Y
 body = (
     body.faces(">Y").workplane(centerOption="CenterOfBoundBox")
-    .center(0, 32.5)
+    .pushPoints([(-41, 32.5), (41, 32.5), (-41, -32.5), (41, -32.5)])
     .hole(4.5)
 )
 
-cq.exporters.export(body, "P001_body.step")
+cq.exporters.export(body, "step/P001_body.step")
+cq.exporters.export(body, "preview/P001_body.svg",
+    exportType=cq.exporters.ExportTypes.SVG, opt={"width": 600, "height": 400})
 ```
 
-### cylinder_shell 型のビルド手順
+### 単純な box_shell（張り出しなし）の場合
 
-同じ原則: `cylinder()` → `shell()` → 端面フィーチャー → 側面フィーチャー
+Phase A で union がないため、そのまま box → Phase B（fillet → shell）→ Phase C。
+
+```python
+body = cq.Workplane("XY").box(W, D, H)
+# Phase A skip (no union needed)
+body = body.edges("|Z").fillet(fr)
+body = body.faces(">Z").shell(-wall)
+# Phase C: features ...
+```
 
 ### plate 型のビルド手順
 
@@ -398,13 +432,18 @@ cq.exporters.export(body, "P001_body.step")
 
 ### 重要な注意事項
 
-1. **shell() 後の内面は `.workplane(offset=wall)` で取得する**
+1. **union() は fillet/shell の前に完了する**
+   - union 後に fillet/shell をかけることで、合体部のエッジも含めて統一的に処理される
+2. **shell() 後の内面は `.workplane(offset=wall)` で取得する**
    - `.faces("<Z[-2]")` のようなインデックスセレクタは面構成の変化で不安定
-2. **union() 後に穴を開ける**
+3. **union() 後に穴を開ける**
    - union 前の個別パーツに穴を開けてから union すると、穴が埋まることがある
-3. **各フィーチャーのコードに ID コメントを付ける**
-   - `# feature: PG7_left | face: -Z` のように、feature_mapping との対応を明示
-4. **1フィーチャー=1操作を原則にする**
+4. **extrude_direction に従って符号を決める**
+   - `"inward"`: workplane 法線と逆方向（`-height`）
+   - `"outward"`: workplane 法線と同方向（`+height`）
+5. **各フィーチャーのコードに ID + semantic コメントを付ける**
+   - `# feature: PG7_left | face: -Z | semantic: cable_gland`
+6. **1フィーチャー=1操作を原則にする**
    - pushPoints でまとめて穴を開けるのはOK（同一パターンの穴グループの場合）
    - 異なるタイプのフィーチャーは別操作にする
 
@@ -414,3 +453,4 @@ cq.exporters.export(body, "P001_body.step")
 pip install cadquery --break-system-packages
 python -c "import cadquery as cq; print('CadQuery OK:', cq.__version__)"
 ```
+

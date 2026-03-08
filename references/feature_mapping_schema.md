@@ -2,6 +2,22 @@
 
 Stage 3.5 で生成する `feature_mapping.json` の詳細仕様。
 
+## 設計思想: 2レイヤー構造
+
+feature_mapping.json は**2つのレイヤー**で部品を記述する:
+
+| レイヤー | 目的 | 記述対象 |
+|---------|------|---------|
+| **構造レイヤー** (`geometry_tree` + `finishing`) | 部品の外形を確定する | プリミティブの Boolean 木、fillet/shell |
+| **加工レイヤー** (`features`) | 確定した外形にフィーチャーを適用する | 穴、ボス、溝 等 |
+
+**なぜ分けるのか**: 取付耳やフランジなど「外形輪郭の拡張」は、穴あけやボス追加とは本質的に異なる。外形はプリミティブの Boolean 合成で表現し、穴・ボスは後加工として適用する。これにより:
+- `mounting_ear` や `rib` のような個別タイプを列挙する必要がなくなる
+- 外形が確定してから加工するため、面セレクタが安定する
+- 構造レイヤーだけでプレビューSVGを生成し、事前に外形を検証できる
+
+---
+
 ## トップレベル構造
 
 ```json
@@ -34,123 +50,174 @@ Stage 3.5 で生成する `feature_mapping.json` の詳細仕様。
 {
   "part_id": "P001",
   "name": "ボディ",
-  "base_shape": { ... },
+  "geometry_tree": { ... },
+  "finishing": { ... },
   "features": [ ... ]
 }
 ```
 
-## base_shape — ベース形状定義
+---
 
-### 共通フィールド
+## geometry_tree — 構造レイヤー（外形定義）
+
+部品の外形を**プリミティブの Boolean 木**として記述する。
+ツリーのノードはプリミティブ（リーフ）か Boolean 操作（ブランチ）のいずれか。
+
+### ノードタイプ
+
+#### プリミティブノード（リーフ）
+
+```json
+{
+  "primitive": "box",
+  "params": {"W": 70, "D": 45, "H": 85},
+  "transform": {"translate": [0, 0, 0]},
+  "semantic_tag": "main_body"
+}
+```
 
 | フィールド | 型 | 必須 | 説明 |
 |-----------|-----|------|------|
-| `type` | string | ✅ | 形状タイプ（下表参照） |
-| `fillet_radius` | number | | 外周フィレット半径 (mm) |
+| `primitive` | string | ✅ | `"box"`, `"cylinder"`, `"polygon_extrude"` |
+| `params` | object | ✅ | プリミティブ固有のパラメータ（下表） |
+| `transform` | object | | 位置変換。`translate: [x,y,z]`, `rotate: [ax,ay,az]` |
+| `semantic_tag` | string | | 意味ラベル（自由文字列。列挙型でない） |
 
-### タイプ別フィールド
+**プリミティブの params:**
 
-#### `box_shell` — 箱型ケース
+| primitive | params | 説明 |
+|-----------|--------|------|
+| `box` | `{"W": 幅, "D": 奥行, "H": 高さ}` | 原点中心の直方体 |
+| `cylinder` | `{"radius": 半径, "height": 高さ}` | 原点中心の円柱（Z軸方向） |
+| `polygon_extrude` | `{"points": [[x,y],...], "height": 高さ}` | 多角形の押し出し |
 
-```json
-{
-  "type": "box_shell",
-  "dimensions": {"W": 70, "D": 45, "H": 85},
-  "wall_thickness": 3,
-  "open_face": "+Z",
-  "fillet_radius": 2
-}
-```
+**semantic_tag の例:**
+`"main_body"`, `"mounting_ear"`, `"stiffener_rib"`, `"cable_channel"`, `"flange"` 等。
+これは人間の理解とコードコメント用であり、CadQuery の操作選択には影響しない。
 
-| フィールド | 説明 |
-|-----------|------|
-| `dimensions.W/D/H` | 外形寸法 (mm) |
-| `wall_thickness` | 壁厚 (mm) |
-| `open_face` | shell で開放する面 ("+Z", "-Z", etc.) |
-
-CadQuery: `box(W, D, H)` → `edges("|Z").fillet(r)` → `faces(open_face).shell(-wall)`
-
-#### `cylinder_shell` — 円柱ケース
+#### Boolean 操作ノード（ブランチ）
 
 ```json
 {
-  "type": "cylinder_shell",
-  "outer_diameter": 60,
-  "height": 100,
-  "wall_thickness": 2,
-  "open_face": "+Z",
-  "fillet_radius": 1
+  "operation": "union",
+  "children": [
+    { "primitive": "box", "params": {"W": 70, "D": 45, "H": 85}, "semantic_tag": "main_body" },
+    { "primitive": "box", "params": {"W": 14, "D": 3, "H": 14},
+      "transform": {"translate": [-41, 24, 32.5]},
+      "semantic_tag": "mounting_ear" }
+  ]
 }
 ```
 
-| フィールド | 説明 |
-|-----------|------|
-| `outer_diameter` | 外径 (mm) |
-| `height` | 高さ (mm) |
-| `wall_thickness` | 壁厚 (mm) |
-| `open_face` | shell で開放する端面 |
+| フィールド | 型 | 必須 | 説明 |
+|-----------|-----|------|------|
+| `operation` | string | ✅ | `"union"`, `"subtract"`, `"intersect"` |
+| `children` | array | ✅ | 子ノード（プリミティブまたは別の Boolean ノード） |
 
-CadQuery: `cylinder(height=H, radius=OD/2)` → `faces(open_face).shell(-wall)`
+**子ノードは再帰的にネストできる。** ただし実用上、深さ3以上は稀。
 
-#### `plate` — 平板
+### 完全な geometry_tree 例（耳付きケース）
 
 ```json
 {
-  "type": "plate",
-  "dimensions": {"W": 70, "H": 85, "T": 5},
-  "fillet_radius": 2
+  "geometry_tree": {
+    "operation": "union",
+    "children": [
+      {
+        "primitive": "box",
+        "params": {"W": 70, "D": 45, "H": 85},
+        "semantic_tag": "main_body"
+      },
+      {
+        "primitive": "box",
+        "params": {"W": 14, "D": 3, "H": 14},
+        "transform": {"translate": [-41, 24, 32.5]},
+        "semantic_tag": "mounting_ear_TL"
+      },
+      {
+        "primitive": "box",
+        "params": {"W": 14, "D": 3, "H": 14},
+        "transform": {"translate": [41, 24, 32.5]},
+        "semantic_tag": "mounting_ear_TR"
+      },
+      {
+        "primitive": "box",
+        "params": {"W": 14, "D": 3, "H": 14},
+        "transform": {"translate": [-41, 24, -32.5]},
+        "semantic_tag": "mounting_ear_BL"
+      },
+      {
+        "primitive": "box",
+        "params": {"W": 14, "D": 3, "H": 14},
+        "transform": {"translate": [41, 24, -32.5]},
+        "semantic_tag": "mounting_ear_BR"
+      }
+    ]
+  }
 }
 ```
 
-| フィールド | 説明 |
-|-----------|------|
-| `dimensions.W/H` | 幅・高さ (mm) |
-| `dimensions.T` | 板厚 (mm) |
+### 単純な部品の geometry_tree（プリミティブのみ）
 
-CadQuery: `box(W, H, T)` → `edges("|Z").fillet(r)`
-
-#### `bracket_L` — L字ブラケット
+耳や張り出しがない単純な箱型ケースは、Boolean ノードなしでプリミティブだけ:
 
 ```json
 {
-  "type": "bracket_L",
-  "base": {"W": 50, "D": 30, "T": 3},
-  "wall": {"W": 50, "H": 40, "T": 3},
-  "fillet_radius": 2,
-  "inner_fillet": 3
+  "geometry_tree": {
+    "primitive": "box",
+    "params": {"W": 100, "D": 60, "H": 40},
+    "semantic_tag": "main_body"
+  }
 }
 ```
-
-| フィールド | 説明 |
-|-----------|------|
-| `base` | 取付面（底板） |
-| `wall` | 立ち上がり面 |
-| `inner_fillet` | L字内側のフィレット |
-
-CadQuery: 底板 `box()` + 立壁 `box()` → `union()` → 内側 `fillet()`
-
-#### `bracket_U` — U字チャネル
-
-```json
-{
-  "type": "bracket_U",
-  "outer": {"W": 40, "H": 30, "L": 100},
-  "wall_thickness": 3,
-  "open_face": "+Z"
-}
-```
-
-| フィールド | 説明 |
-|-----------|------|
-| `outer` | 外形 W×H×L |
-| `wall_thickness` | 壁厚 |
-| `open_face` | 溝が開いている面 |
-
-CadQuery: `box(W, H, L)` → 内部を `cut()`
 
 ---
 
-## features 配列 — フィーチャー定義
+## finishing — ベース形状の仕上げ
+
+`geometry_tree` で構成された外形に適用する仕上げ操作。
+fillet → shell の順序が CadQuery では必須（逆順はカーネルエラー）。
+
+```json
+{
+  "finishing": {
+    "fillet": {
+      "edge_selector": "|Y",
+      "radius": 2
+    },
+    "shell": {
+      "open_face": "-Y",
+      "thickness": 3,
+      "cq_selector": ".faces('<Y')"
+    }
+  }
+}
+```
+
+| フィールド | 型 | 必須 | 説明 |
+|-----------|-----|------|------|
+| `fillet.edge_selector` | string | | フィレット対象エッジ（例: `"\|Z"`, `"\|Y"`） |
+| `fillet.radius` | number | | フィレット半径 (mm) |
+| `shell.open_face` | string | | shell で開放する面 (`"+Z"`, `"-Y"` 等) |
+| `shell.thickness` | number | | 壁厚 (mm) |
+| `shell.cq_selector` | string | | CadQuery 面セレクタ |
+
+`finishing` が不要な部品（蓋など）は省略またはフィールドを個別に省略可能:
+
+```json
+{
+  "finishing": {
+    "fillet": { "edge_selector": "|Y", "radius": 2 }
+  }
+}
+```
+
+---
+
+## features 配列 — 加工レイヤー（穴・ボス・溝等）
+
+`geometry_tree` + `finishing` で確定した外形に対して適用する加工フィーチャー。
+**構造レイヤー完了後に適用されるため、面セレクタが安定している。**
 
 ### 共通フィールド
 
@@ -163,6 +230,16 @@ CadQuery: `box(W, H, L)` → 内部を `cut()`
 | `cq_selector` | string | ✅ | CadQuery 面セレクタ (例: `".faces('<Z')"`) |
 | `position_on_face` | object | | 面上の位置 `{"x": 0, "y": 0}` (面の中心からのオフセット mm) |
 | `build_order` | integer | ✅ | ビルド順序（小さい順に実行） |
+| `extrude_direction` | string | | `"inward"` / `"outward"`。boss・rect_pad 等の押出し方向を明示 |
+
+### extrude_direction について
+
+`boss` や `rect_pad` など押し出しを伴うフィーチャーでは、shell 後の workplane 法線方向が予測困難なため、意図する方向を明示する:
+
+- `"inward"`: ケース内側に向かって押し出す（ボス、リブ等）
+- `"outward"`: ケース外側に向かって押し出す（外部突起等）
+
+CadQuery コード生成時に、workplane の法線方向と `extrude_direction` を照合して `extrude()` の符号を決定する。
 
 ### フィーチャータイプ別の追加フィールド
 
@@ -183,15 +260,18 @@ CadQuery: `box(W, H, L)` → 内部を `cut()`
 
 #### `boss`
 ```json
-{"diameter": 8.0, "height": 15.0, "inner_hole_dia": 4.2, "inner_hole_depth": 8.0}
+{"diameter": 8.0, "height": 15.0, "inner_hole_dia": 4.2, "inner_hole_depth": 8.0,
+ "extrude_direction": "inward"}
 ```
 inner_hole_* はタッピング下穴やインサート穴のオプション。
 
 #### `rect_pad`
 ```json
-{"width": 70, "height": 15, "thickness": 3}
+{"width": 70, "height": 15, "thickness": 3,
+ "extrude_direction": "outward"}
 ```
-取付耳やリブなどの突起。
+
+> ⚠️ **rect_pad の使用前チェック**: `position_on_face` がベース形状の外側にある場合、それは外形の拡張（耳・フランジ）であり `rect_pad` ではなく `geometry_tree` の `union` で対応すべき。
 
 #### `rect_pocket`
 ```json
@@ -211,13 +291,14 @@ inner_hole_* はタッピング下穴やインサート穴のオプション。
 
 | 順序 | 対象 | 理由 |
 |------|------|------|
-| 1 | ベース形状生成 | `box()` / `cylinder()` |
-| 2 | 外周フィレット | shell の前にフィレット（逆順はカーネルエラー） |
-| 3 | シェル化 | `shell()` で箱にする |
-| 4-N | 面ごとのフィーチャー | `-Z` 面 → `+Y` 面 → … の順序は任意だが、一面ずつ完了させる |
+| (自動) | geometry_tree の構築 | プリミティブ → union/subtract |
+| (自動) | finishing (fillet → shell) | shell の前に fillet（逆順はカーネルエラー） |
+| 1-N | 面ごとのフィーチャー | 一面ずつ完了させる |
 | N+1 | ボス・スタンドオフ | shell 後の内面を `offset` で指定して追加 |
-| N+2 | 追加形状 (耳等) | union 後に穴を加工 |
 | 最後 | ガスケット溝等 | 合わせ面のフィーチャーは最後 |
+
+geometry_tree の構築と finishing は build_order 以前に自動的に実行される。
+`features` 配列内の `build_order` は加工レイヤー内の相対順序。
 
 ## 複数穴の位置指定パターン
 
@@ -233,9 +314,23 @@ inner_hole_* はタッピング下穴やインサート穴のオプション。
     {"x": -15, "y": 5},
     {"x": 15, "y": 5}
   ],
-  "build_order": 4
+  "build_order": 1
 }
 ```
 
 `pattern` が `"linear"` の場合 `positions` 配列で各穴位置を明示。
 `pattern` が `"rectangular"` の場合は `pitch_x`, `pitch_y`, `count_x`, `count_y` で指定可能。
+
+---
+
+## 旧スキーマとの互換性
+
+旧スキーマ（`base_shape` ベース）から新スキーマ（`geometry_tree` ベース）への移行:
+
+| 旧フィールド | 新フィールド | 移行方法 |
+|-------------|-------------|---------|
+| `base_shape.type: "box_shell"` | `geometry_tree.primitive: "box"` + `finishing.shell` | box のパラメータを `geometry_tree` に、shell/fillet を `finishing` に |
+| `base_shape.type: "cylinder_shell"` | `geometry_tree.primitive: "cylinder"` + `finishing.shell` | 同上 |
+| `base_shape.type: "plate"` | `geometry_tree.primitive: "box"` (薄い) | finishing は fillet のみ |
+| `base_shape.type: "bracket_L"` | `geometry_tree.operation: "union"` + 2つの box | 2つの box プリミティブの union |
+| 取付耳の `rect_pad` | `geometry_tree` 内の union 子ノード | 外形の一部としてツリーに含める |

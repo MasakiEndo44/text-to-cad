@@ -277,12 +277,24 @@ def _resolve_hole_positions(iface, face, W, H, D, wall):
     results = []
     spacing_str = iface.get("spacing", "")
 
-    if face == "back" and (spacing_str or itype == "mounting_hole"):
+    if face == "back" and (spacing_str or itype == "mounting_hole" or "耳" in name):
         sw = sh = None
         if spacing_str:
             nums = re.findall(r'(\d+\.?\d*)mm', spacing_str)
             if len(nums) >= 2:
                 sw, sh = float(nums[0]), float(nums[1])
+            elif len(nums) == 1:
+                if "上下" in spacing_str or "縦" in spacing_str:
+                    sh = float(nums[0])
+                    sw = W + 12
+                else:
+                    sw = float(nums[0])
+                    sh = H + 12
+        else:
+            if "耳" in name or "取付" in name:
+                sw = W + 12
+                sh = H - 20
+
         edge = _parse_number(spec, r'端から(\d+\.?\d*)mm') or 6.0
         if sw is not None and sh is not None:
             cx, cy = W / 2, H / 2
@@ -411,6 +423,16 @@ def extract_dims(req: dict, params: dict) -> dict:
                             "label": comp.get("name", "PCB")}
                 break
 
+        fl = {"l": 0, "r": 0, "t": 0, "b": 0}
+        for f, fx, fy, dia, lbl in d["features"]:
+            if f == "back":
+                r = dia/2 + 5
+                if fx - r < 0: fl["l"] = max(fl["l"], -(fx - r))
+                if fx + r > d["width"]: fl["r"] = max(fl["r"], (fx + r) - d["width"])
+                if fy - r < 0: fl["t"] = max(fl["t"], -(fy - r))
+                if fy + r > d["height"]: fl["b"] = max(fl["b"], (fy + r) - d["height"])
+        d["flange"] = fl
+
     if params:
         def vp(section, key):
             s = params.get(section, {})
@@ -458,13 +480,36 @@ def draw_front(svg, d, ox, oy, sc):
     wp = d["wall"]   * sc   # wall in px
     fr = d["fillet"]  * sc
 
+    fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
+    if any(fl.values()):
+        svg.rect(ox - fl["l"]*sc, oy - fl["t"]*sc, W + (fl["l"]+fl["r"])*sc, H + (fl["t"]+fl["b"])*sc,
+                 fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=fr)
+
     # 外形 + 内壁隠れ線
     svg.rect(ox, oy, W, H, fill=COLOR_FACE_FRONT, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
+
     svg.rect(ox + wp, oy + wp, W - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
              rx=max(0.0, fr - wp))
+    drawn_labels = []
+    drawn_keys = set()
+    def place_label(x, y, label, ox_off, oy_off):
+        if label in drawn_keys:
+            return
+        drawn_keys.add(label)
+        
+        lx, ly = x + ox_off, y + oy_off
+        for _ in range(15):
+            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
+                break
+            ly += 14
+        if abs(ly - (y + oy_off)) > 1:
+            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
+        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
+        drawn_labels.append((lx, ly))
 
-    drawn = set()
+
+
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
@@ -472,28 +517,20 @@ def draw_front(svg, d, ox, oy, sc):
             # 軸 +Z ∥ 視線 → 実線の円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=False)
-            k = _label_key(label, cx, cy)
-            if k not in drawn:
-                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
-                drawn.add(k)
+            place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
 
         elif face == "back":
             # 軸 -Z ∥ 視線 (裏側) → 隠れ線の円
             cx, cy = ox + fx * sc, oy + fy * sc
+
             svg.feature_circle(cx, cy, r, hidden=True)
-            k = _label_key(label, cx, cy)
-            if k not in drawn:
-                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
-                drawn.add(k)
+            place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
 
         elif face == "bottom":
             # 軸 -Y ⊥ 視線 → 2本の垂直破線 (底辺から壁厚分)
             cx = ox + fx * sc
             svg.feature_side_v(cx, r, oy + H - wp, oy + H, hidden=True)
-            k = _label_key(label, cx, oy + H)
-            if k not in drawn:
-                svg.feature_label(cx, oy + H - wp, label, offset_x=max(r+6, 12), offset_y=-6)
-                drawn.add(k)
+            place_label(cx, oy + H - wp, label, max(r+6, 12), -6)
 
         elif face == "top":
             # 軸 +Y ⊥ 視線 → 2本の垂直破線 (上辺から壁厚分)
@@ -501,7 +538,7 @@ def draw_front(svg, d, ox, oy, sc):
             svg.feature_side_v(cx, r, oy, oy + wp, hidden=True)
 
     # 寸法線
-    svg.dim_h(ox, oy, ox + W, f"{d['width']:.0f}", above=True)
+    # svg.dim_h(ox, oy, ox + W, f"{d['width']:.0f}", above=True) # 底面図とダブるため省略
     svg.dim_v(oy, ox, oy + H, f"{d['height']:.0f}", left_side=True)
     svg.view_title(ox + W/2, oy + H + 30, "正面図 FRONT VIEW")
 
@@ -515,12 +552,33 @@ def draw_side(svg, d, ox, oy, sc):
     wp = d["wall"]   * sc
     fr = d["fillet"]  * sc
 
+    fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
+    if any(fl.values()):
+        svg.rect(ox + Dp - wp, oy - fl["t"]*sc, wp, H + (fl["t"]+fl["b"])*sc, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
+
     svg.rect(ox, oy, Dp, H, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
     svg.rect(ox + wp, oy + wp, Dp - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
              rx=max(0.0, fr - wp))
+    drawn_labels = []
+    drawn_keys = set()
+    def place_label(x, y, label, ox_off, oy_off):
+        if label in drawn_keys:
+            return
+        drawn_keys.add(label)
+        
+        lx, ly = x + ox_off, y + oy_off
+        for _ in range(15):
+            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
+                break
+            ly += 14
+        if abs(ly - (y + oy_off)) > 1:
+            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
+        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
+        drawn_labels.append((lx, ly))
 
-    drawn = set()
+
+
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
@@ -528,29 +586,21 @@ def draw_side(svg, d, ox, oy, sc):
             # 軸 +Z ⊥ 視線 → 2本の水平破線（前面=左端から壁厚分）
             cy = oy + fy * sc
             svg.feature_side_h(cy, r, ox, ox + wp, hidden=True)
-            k = _label_key(label, ox, cy)
-            if k not in drawn:
-                svg.feature_label(ox + wp + 4, cy, label, offset_x=12, offset_y=-max(r+3, 8))
-                drawn.add(k)
+            place_label(ox + wp + 4, cy, label, 12, -max(r+3, 8))
 
         elif face == "back":
             # 軸 -Z ⊥ 視線 → 2本の水平破線（背面=右端から壁厚分）
             cy = oy + fy * sc
+            
             svg.feature_side_h(cy, r, ox + Dp - wp, ox + Dp, hidden=True)
-            k = _label_key(label, ox + Dp, cy)
-            if k not in drawn:
-                svg.feature_label(ox + Dp - wp - 4, cy, label, offset_x=-12, offset_y=-max(r+3, 8))
-                drawn.add(k)
+            place_label(ox + Dp - wp - 4, cy, label, -12, -max(r+3, 8))
 
         elif face == "bottom":
             # 軸 -Y ⊥ 視線 → 2本の垂直破線（底辺から壁厚分）
             # fy は底面上の depth 方向座標 → 側面図の u 座標
             cu = ox + fy * sc
             svg.feature_side_v(cu, r, oy + H - wp, oy + H, hidden=True)
-            k = _label_key(label, cu, oy + H)
-            if k not in drawn:
-                svg.feature_label(cu, oy + H - wp, label, offset_x=max(r+6, 10), offset_y=-6)
-                drawn.add(k)
+            place_label(cu, oy + H - wp, label, max(r+6, 10), -6)
 
         elif face == "side":
             # 軸 ±X ∥ 視線 → 円
@@ -571,6 +621,10 @@ def draw_bottom(svg, d, ox, oy, sc):
     wp = d["wall"]  * sc
     fr = d["fillet"] * sc
 
+    fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
+    if any(fl.values()):
+        svg.rect(ox - fl["l"]*sc, oy + Dp - wp, W + (fl["l"]+fl["r"])*sc, wp, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
+
     svg.rect(ox, oy, W, Dp, fill=COLOR_FACE_TOP, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
     svg.rect(ox + wp, oy + wp, W - 2*wp, Dp - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
@@ -584,8 +638,25 @@ def draw_bottom(svg, d, ox, oy, sc):
                  fill="none", stroke="#4477aa", sw=0.8, dash="3,3")
         pcb_label = d["pcb"].get("label", "PCB")
         svg.text(ox + W/2, oy + Dp/2, pcb_label, size=8, color="#4477aa")
+    drawn_labels = []
+    drawn_keys = set()
+    def place_label(x, y, label, ox_off, oy_off):
+        if label in drawn_keys:
+            return
+        drawn_keys.add(label)
+        
+        lx, ly = x + ox_off, y + oy_off
+        for _ in range(15):
+            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
+                break
+            ly += 14
+        if abs(ly - (y + oy_off)) > 1:
+            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
+        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
+        drawn_labels.append((lx, ly))
 
-    drawn = set()
+
+
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
@@ -593,10 +664,7 @@ def draw_bottom(svg, d, ox, oy, sc):
             # 軸 -Y ∥ 視線 → 実線の円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=False)
-            k = _label_key(label, cx, cy)
-            if k not in drawn:
-                svg.feature_label(cx, cy, label, offset_x=max(r+6, 12), offset_y=-max(r+4, 10))
-                drawn.add(k)
+            place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
 
         elif face == "top":
             # 軸 +Y ∥ 視線 (裏側) → 隠れ線の円
@@ -608,19 +676,14 @@ def draw_bottom(svg, d, ox, oy, sc):
             # front 穴は (fx, fy) = (X座標, Y/高さ座標)。底面図では X が u。
             cu = ox + fx * sc
             svg.feature_side_v(cu, r, oy, oy + wp, hidden=True)
-            k = _label_key(label, cu, oy)
-            if k not in drawn:
-                svg.feature_label(cu, oy + wp, label, offset_x=max(r+6, 12), offset_y=10)
-                drawn.add(k)
+            place_label(cu, oy + wp, label, max(r+6, 12), 10)
 
         elif face == "back":
             # 軸 -Z ⊥ 視線 → 2本の垂直破線（背面端=下端から壁厚分）
             cu = ox + fx * sc
+            
             svg.feature_side_v(cu, r, oy + Dp - wp, oy + Dp, hidden=True)
-            k = _label_key(label, cu, oy + Dp)
-            if k not in drawn:
-                svg.feature_label(cu, oy + Dp - wp, label, offset_x=max(r+6, 12), offset_y=-6)
-                drawn.add(k)
+            place_label(cu, oy + Dp - wp, label, max(r+6, 12), -6)
 
     # 底面穴グループ間隔寸法
     bottom_feats = [(fx, fy) for f, fx, fy, dia, lbl in d["features"] if f == "bottom"]
@@ -641,7 +704,7 @@ def draw_bottom(svg, d, ox, oy, sc):
     # 外形寸法
     svg.dim_h(ox, oy + Dp + 28, ox + W, f"{d['width']:.0f}", above=False)
     svg.dim_v(oy, ox + W, oy + Dp, f"{d['depth']:.0f}", left_side=False)
-    svg.view_title(ox + W/2, oy - 22, "底面図 BOTTOM VIEW")
+    svg.view_title(ox + W/2, oy - 45, "底面図 BOTTOM VIEW")
 
 
 

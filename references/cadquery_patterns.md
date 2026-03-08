@@ -223,9 +223,234 @@ cq.exporters.export(body, "preview_body.stl")
 | `face selector returns empty` | shell/cut 後に面構成が変化 | offset workplane 方式に切り替え |
 | `Null TopoDS_Shape` | 形状が破綻（ゼロ厚み等） | 肉厚を大きくする、形状を単純化 |
 
+## パターン7: 円柱シェル（cylinder_shell）
+
+```python
+import cadquery as cq
+import json
+
+with open("parameters.json") as f:
+    params = json.load(f)
+
+def p(cat, key):
+    return params[cat][key]["value"]
+
+OD = p("outer_envelope", "outer_diameter")
+H  = p("outer_envelope", "height")
+wall = p("global", "wall_thickness")
+
+# 基本形状
+body = cq.Workplane("XY").cylinder(H, OD / 2)
+
+# シェル（上面を開放）
+body = body.faces(">Z").shell(-wall)
+
+# 端面に穴
+body = (
+    body.faces("<Z").workplane()
+    .hole(p("features", "bottom_hole_dia"))
+)
+
+# 円筒側面の穴（角度指定）
+# ⚠️ 円筒面を選択するには RadiusNthSelector または >X, <X 等
+body = (
+    body.faces(">X").workplane()
+    .center(0, 10)  # Z方向オフセット
+    .hole(p("features", "side_hole_dia"))
+)
+
+cq.exporters.export(body, "P001_cylinder_body.step")
+```
+
+## パターン8: L字ブラケット（bracket_L）
+
+```python
+import cadquery as cq
+
+base_W, base_D, base_T = 50, 30, 3
+wall_W, wall_H, wall_T = 50, 40, 3
+inner_R = 3
+
+# 底板
+base = cq.Workplane("XY").box(base_W, base_D, base_T)
+
+# 立ち上がり壁（底板の+Y端に接続）
+wall = (
+    cq.Workplane("XY")
+    .workplane(offset=base_T / 2)
+    .center(0, base_D / 2 - wall_T / 2)
+    .box(wall_W, wall_T, wall_H)
+    .translate((0, 0, wall_H / 2))
+)
+
+bracket = base.union(wall)
+
+# 底板に取付穴
+bracket = (
+    bracket.faces("<Z").workplane()
+    .rect(30, 20, forConstruction=True).vertices()
+    .hole(4.5)
+)
+
+cq.exporters.export(bracket, "bracket_L.step")
+```
+
+---
+
+## 統合ビルドテンプレート（最重要） — geometry_tree 駆動
+
+`feature_mapping.json` の `geometry_tree` + `finishing` + `features` からコードを組み立てる標準手順。
+コードは3フェーズで構成する。
+
+### なぜ順序が重要か
+
+CadQuery/OpenCASCADE は操作ごとに面・エッジの構成が変わる。
+特に `shell()` と `union()` の後は、面セレクタ（`>Z` 等）が拾う面が変わる。
+**外形の構築（union）→ 仕上げ（fillet/shell）→ 加工（穴/ボス）の順序を厳守する。**
+
+### 3フェーズ構成
+
+```
+Phase A: 構造構築 — geometry_tree のプリミティブを生成し Boolean 合体
+Phase B: 仕上げ   — fillet → shell（順序厳守）
+Phase C: フィーチャー — 穴・ボス・溝（build_order 順）
+```
+
+### 基本テンプレート（耳付き box_shell の例）
+
+```python
+import cadquery as cq
+import json
+
+# ── Step 0: パラメータ読み込み ──
+with open("parameters.json") as f:
+    params = json.load(f)
+with open("feature_mapping.json") as f:
+    fmap = json.load(f)
+
+def p(cat, key):
+    return params[cat][key]["value"]
+
+W = p("outer_envelope", "width")
+D = p("outer_envelope", "depth")
+H = p("outer_envelope", "height")
+wall = p("global", "wall_thickness")
+fr = p("global", "fillet_radius")
+
+# ══════════════════════════════════════════════════════
+# Phase A: 構造構築（geometry_tree → CadQuery）
+# ══════════════════════════════════════════════════════
+
+# geometry_tree.children[0] | semantic: main_body
+body = cq.Workplane("XY").box(W, D, H)
+
+# geometry_tree.children[1..4] | semantic: mounting_ear_*
+# 耳を別 body として生成し union
+ear_positions = [(-41, 24, 32.5), (41, 24, 32.5),
+                 (-41, 24, -32.5), (41, 24, -32.5)]
+ear_w, ear_d, ear_h = 14, 3, 14
+
+for pos in ear_positions:
+    ear = cq.Workplane("XY").box(ear_w, ear_d, ear_h)
+    ear = ear.translate(pos)
+    body = body.union(ear)
+
+# ── Phase A 中間検証 ──
+bb = body.val().BoundingBox()
+print(f"[CHECK] Phase A BB: {bb.xlen:.1f} x {bb.ylen:.1f} x {bb.zlen:.1f}")
+cq.exporters.export(body, "preview/P001_phase_a.svg",
+    exportType=cq.exporters.ExportTypes.SVG, opt={"width": 400, "height": 300})
+
+# ══════════════════════════════════════════════════════
+# Phase B: 仕上げ（finishing: fillet → shell）
+# ══════════════════════════════════════════════════════
+
+# finishing.fillet
+body = body.edges("|Y").fillet(fr)
+
+# finishing.shell | open_face: -Y
+body = body.faces("<Y").shell(-wall)
+
+# ── Phase B 中間検証 ──
+bb = body.val().BoundingBox()
+print(f"[CHECK] Phase B BB: {bb.xlen:.1f} x {bb.ylen:.1f} x {bb.zlen:.1f}")
+
+# ══════════════════════════════════════════════════════
+# Phase C: フィーチャー適用（features 配列 build_order 順）
+# ══════════════════════════════════════════════════════
+
+# feature: pg7_hole_left | face: -Z
+body = (
+    body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
+    .center(-15, 0)
+    .hole(12.5)
+)
+
+# feature: pg7_hole_right | face: -Z
+body = (
+    body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
+    .center(15, 0)
+    .hole(12.5)
+)
+
+# feature: M3_boss_array | face: inner_back | extrude_direction: inward
+# shell 後の内面は offset workplane で取得
+# ⚠️ .faces("<Y[-2]") は不安定！offset 方式を使う
+wp = body.faces(">Y").workplane(offset=-wall, centerOption="CenterOfBoundBox")
+body = (
+    wp.pushPoints([(-29, 32.5), (29, 32.5), (-29, -32.5), (29, -32.5)])
+    .circle(4).extrude(-42)  # inward = workplane法線と逆方向
+)
+
+# feature: mount_holes_on_ears | face: +Y
+body = (
+    body.faces(">Y").workplane(centerOption="CenterOfBoundBox")
+    .pushPoints([(-41, 32.5), (41, 32.5), (-41, -32.5), (41, -32.5)])
+    .hole(4.5)
+)
+
+cq.exporters.export(body, "step/P001_body.step")
+cq.exporters.export(body, "preview/P001_body.svg",
+    exportType=cq.exporters.ExportTypes.SVG, opt={"width": 600, "height": 400})
+```
+
+### 単純な box_shell（張り出しなし）の場合
+
+Phase A で union がないため、そのまま box → Phase B（fillet → shell）→ Phase C。
+
+```python
+body = cq.Workplane("XY").box(W, D, H)
+# Phase A skip (no union needed)
+body = body.edges("|Z").fillet(fr)
+body = body.faces(">Z").shell(-wall)
+# Phase C: features ...
+```
+
+### plate 型のビルド手順
+
+薄い `box()` → `fillet()` → 穴あけ → 嵌合スカート `extrude`
+
+### 重要な注意事項
+
+1. **union() は fillet/shell の前に完了する**
+   - union 後に fillet/shell をかけることで、合体部のエッジも含めて統一的に処理される
+2. **shell() 後の内面は `.workplane(offset=wall)` で取得する**
+   - `.faces("<Z[-2]")` のようなインデックスセレクタは面構成の変化で不安定
+3. **union() 後に穴を開ける**
+   - union 前の個別パーツに穴を開けてから union すると、穴が埋まることがある
+4. **extrude_direction に従って符号を決める**
+   - `"inward"`: workplane 法線と逆方向（`-height`）
+   - `"outward"`: workplane 法線と同方向（`+height`）
+5. **各フィーチャーのコードに ID + semantic コメントを付ける**
+   - `# feature: PG7_left | face: -Z | semantic: cable_gland`
+6. **1フィーチャー=1操作を原則にする**
+   - pushPoints でまとめて穴を開けるのはOK（同一パターンの穴グループの場合）
+   - 異なるタイプのフィーチャーは別操作にする
+
 ## CadQuery インストール確認
 
 ```bash
 pip install cadquery --break-system-packages
 python -c "import cadquery as cq; print('CadQuery OK:', cq.__version__)"
 ```
+

@@ -860,15 +860,52 @@ def generate_svg(req_data, param_data, output_path):
     d = extract_dims(req_data, param_data)
     W, D, H = d["width"], d["depth"], d["height"]
 
-    # ── レイアウト計算 (第三角法: 正面=左下, 平面=左上, 側面=右下) ──
+    # ── 寸法マージンの推定 ──────────────────────────────────────────────
+    # 各ビュー外側に寸法線が何段分必要かを事前推定する。
+    # 穴位置寸法は最大 level=4 まで、外形寸法が level=1。
+    # 正面図: 左に dim_v (height + 穴位置), 上に dim_h (穴位置)
+    # 底面図: 下に dim_h (width), 右に dim_v (depth), 上に穴ピッチ
+    # 側面図: 上に dim_h (depth), 右に dim_v (height)
+
+    front_circle_feats = [f for f in d["features"] if f[0] in ("front", "back")]
+    bottom_circle_feats = [f for f in d["features"] if f[0] == "bottom"]
+
+    # 最大段数を推定
+    front_v_levels = 1 + min(len(set(round(fy, 1) for _, _, fy, _, _ in front_circle_feats)), 3)
+    front_h_levels = 1 + min(len(set(round(fx, 1) for _, fx, _, _, _ in front_circle_feats)), 3)
+    bottom_h_levels = 1 + min(len(set(round(fx, 1) for _, fx, _, _, _ in bottom_circle_feats)), 3)
+    bottom_v_levels = 1 + min(len(set(round(fy, 1) for _, _, fy, _, _ in bottom_circle_feats)), 3)
+
+    # ── スケール計算（寸法マージンを含む） ──────────────────────────────
     da_x, da_y = PADDING, PADDING
     da_w = CANVAS_W - PADDING * 2
     da_h = CANVAS_H - PADDING * 2 - TITLE_H
 
-    inner_pad = PADDING * 1.4
-    max_sc_x  = (da_w - VIEW_GAP - inner_pad * 2) / (W + D)
-    max_sc_y  = (da_h - VIEW_GAP - inner_pad * 3) / (D + H)
-    sc = min(max_sc_x, max_sc_y, 5.0)
+    # 各方向の寸法マージン（mm単位 → スケール後にpxになる）
+    # margin_mm = gap1 + gap2 * (max_level - 1) + テキスト余白
+    def dim_margin_mm(max_level):
+        return DIM_GAP1_MM + DIM_GAP2_MM * (max_level - 1) + 8  # 8mm = テキスト余白
+
+    # 左マージン: 正面図の左に垂直寸法
+    margin_left_mm  = dim_margin_mm(front_v_levels)
+    # 上マージン: 底面図の上に水平寸法 + ビュー名
+    margin_top_mm   = dim_margin_mm(max(bottom_h_levels, 2)) + 12  # 12mm for view title
+    # 右マージン: 側面図の右に垂直寸法
+    margin_right_mm = dim_margin_mm(2)
+    # 下マージン: 正面図の下にビュー名
+    margin_bot_mm   = 12  # ビュー名のみ
+    # VIEW_GAP は寸法が両側から重なるため、両ビューの最大段数を考慮
+    view_gap_mm     = dim_margin_mm(2) + dim_margin_mm(1) + 5  # 左右のビュー間
+
+    # 利用可能な描画空間をmm単位で逆算してスケールを決定
+    # X方向: margin_left + W + view_gap + D + margin_right
+    avail_x_mm = W + D + view_gap_mm + margin_left_mm + margin_right_mm
+    # Y方向: margin_top + D + view_gap + H + margin_bot
+    avail_y_mm = D + H + view_gap_mm + margin_top_mm + margin_bot_mm
+
+    sc_x = da_w / avail_x_mm
+    sc_y = da_h / avail_y_mm
+    sc = min(sc_x, sc_y, 5.0)
 
     svg = SVGBuilder(CANVAS_W, CANVAS_H, scale=sc)
     svg.rect(0, 0, CANVAS_W, CANVAS_H, fill=COLOR_BG, stroke="none", sw=0)
@@ -876,23 +913,34 @@ def generate_svg(req_data, param_data, output_path):
     # 描画領域の枠
     svg.rect(da_x, da_y, da_w, da_h, fill="#f9f9fd", stroke="#ccccdd", sw=1.0, rx=4)
 
-    # ── ビュー配置（第三角法 standard） ──
-    # 正面図 (W × H) を基準位置として配置
-    front_ox = da_x + inner_pad
-    front_oy = da_y + inner_pad + D * sc + VIEW_GAP     # 平面図の下
+    # ── ビュー配置（第三角法、寸法マージン考慮） ──────────────────────
+    # 正面図の左上角を基準点として計算
+    margin_left_px  = margin_left_mm * sc
+    margin_top_px   = margin_top_mm * sc
+    view_gap_px     = view_gap_mm * sc
 
-    # 平面図（底面図: W × D）は正面図の真上
-    plan_ox  = front_ox                                   # X は正面図と揃える
-    plan_oy  = da_y + inner_pad                           # 上部に配置
+    # 図面全体を描画領域内でセンタリング
+    total_w_px = margin_left_px + W * sc + view_gap_px + D * sc + margin_right_mm * sc
+    total_h_px = margin_top_px + D * sc + view_gap_px + H * sc + margin_bot_mm * sc
+    offset_x = da_x + (da_w - total_w_px) / 2
+    offset_y = da_y + (da_h - total_h_px) / 2
 
-    # 右側面図 (D × H) は正面図の右
-    side_ox  = front_ox + W * sc + VIEW_GAP
-    side_oy  = front_oy                                   # Y は正面図と揃える
+    # 正面図 (W × H)
+    front_ox = offset_x + margin_left_px
+    front_oy = offset_y + margin_top_px + D * sc + view_gap_px
+
+    # 底面図 (W × D) — 正面図の真上
+    plan_ox  = front_ox
+    plan_oy  = offset_y + margin_top_px
+
+    # 右側面図 (D × H) — 正面図の右
+    side_ox  = front_ox + W * sc + view_gap_px
+    side_oy  = front_oy
 
     # ── 描画 ──
-    draw_bottom(svg, d, plan_ox, plan_oy, sc)          # 平面図位置に底面図
-    draw_front(svg, d, front_ox, front_oy, sc)         # 正面図
-    draw_side(svg, d, side_ox, side_oy, sc)            # 右側面図
+    draw_bottom(svg, d, plan_ox, plan_oy, sc)
+    draw_front(svg, d, front_ox, front_oy, sc)
+    draw_side(svg, d, side_ox, side_oy, sc)
 
     # 投影法記号（タイトルブロックの左上付近）
     proj_sym_x = CANVAS_W - PADDING - 100

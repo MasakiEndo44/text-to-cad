@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """
-Stage 2: SVG 技術図面生成スクリプト (v3 — 正投影図法準拠)
+Stage 2: SVG 技術図面生成スクリプト (v4 — JIS B 0001 準拠)
 
 requirements.json または parameters.json から
-正面図・側面図・底面図の3面図を含む工業図面スタイルの SVG を生成する。
+正面図・平面図（上面/底面）・右側面図の3面図を含む工業図面スタイルの SVG を生成する。
 
-穴フィーチャーの投影ルール (JIS B 0001 / ISO 128 準拠):
+JIS B 0001 / ISO 128 準拠:
+  - 第三角法のビュー配置（正面図=左下、平面図=左上、側面図=右下）
+  - 寸法値は寸法線の上（水平）/ 左（垂直）に配置
+  - 矢印は開き角 30° の塗りつぶし
+  - 寸法線の段重ね対応（level 引数）
+  - 投影法記号の描画
+  - 穴位置寸法を基準面から記入
+
+穴フィーチャーの投影ルール:
   - 穴軸が視線と平行 → 円 (実線 or 隠れ線) ＋ 中心線クロス
   - 穴軸が視線と直交 → 2本の平行破線 (穴径間隔) ＋ 1本の中心線 (一点鎖線)
     線の長さは穴深さ (= 壁厚、貫通穴の場合)
@@ -56,11 +64,17 @@ COLOR_FEAT_LABEL = "#2d6a4f"   # フィーチャーラベル
 
 FONT = "Noto Sans JP, Meiryo, Yu Gothic, Arial, sans-serif"
 
-ARROW_LEN  = 9
-ARROW_W    = 3.5
-DIM_OFFSET = 22
-EXT_MARGIN = 6
-LABEL_SIZE = 12
+# JIS B 0001 準拠の矢印定数
+ARROW_LEN  = 8         # 矢印の長さ (px)
+ARROW_W    = 2.3       # 矢印の半幅 (px) → 開き角 ≈ 30°
+
+# 寸法線の間隔（実寸 mm 単位、スケールで px に変換）
+DIM_GAP1_MM = 10.0     # 外形線から第1寸法線までの距離
+DIM_GAP2_MM = 7.0      # 寸法線同士の距離
+EXT_GAP_MM  = 2.0      # 寸法補助線と外形線の隙間
+EXT_OVER_MM = 3.0      # 寸法補助線が寸法線を超える長さ
+
+LABEL_SIZE = 11
 VIEW_TITLE = 14
 FEAT_LABEL_SIZE = 9
 CL_MARGIN  = 4   # 中心線の線端余白 (px)
@@ -71,9 +85,10 @@ CL_MARGIN  = 4   # 中心線の線端余白 (px)
 class SVGBuilder:
     """SVG 要素を積み上げて最後に文字列化する軽量ビルダー"""
 
-    def __init__(self, width, height):
+    def __init__(self, width, height, scale=1.0):
         self.w = width
         self.h = height
+        self._sc = scale   # mm→px 変換倍率
         self._elems = []
 
     def add(self, s):
@@ -125,6 +140,7 @@ class SVGBuilder:
         )
 
     def _arrow(self, x, y, angle_deg):
+        """JIS B 0001 準拠の塗り矢印（開き角 30°）"""
         a = math.radians(angle_deg)
         tip   = (x, y)
         left  = (x - ARROW_LEN * math.cos(a) + ARROW_W * math.sin(a),
@@ -133,33 +149,88 @@ class SVGBuilder:
                  y - ARROW_LEN * math.sin(a) + ARROW_W * math.cos(a))
         self.polygon([tip, left, right], fill=COLOR_DIM, stroke=COLOR_DIM, sw=0)
 
-    def dim_h(self, x1, y_base, x2, label, above=True):
-        sign  = -1 if above else 1
-        y_dim = y_base + sign * DIM_OFFSET
-        for xp in (x1, x2):
-            y0 = y_base - sign * EXT_MARGIN
-            y1 = y_dim + sign * 6
-            self.line(xp, min(y0, y1), xp, max(y0, y1), stroke=COLOR_DIM, sw=0.8)
-        self.line(x1, y_dim, x2, y_dim, stroke=COLOR_DIM, sw=0.9)
-        self._arrow(x1, y_dim, 180)
-        self._arrow(x2, y_dim, 0)
-        mx = (x1 + x2) / 2
-        self.rect(mx - 22, y_dim - 7, 44, 13, fill="white", stroke="none", sw=0)
-        self.text(mx, y_dim, label, size=LABEL_SIZE, color=COLOR_DIM)
+    # ── JIS 準拠 寸法線メソッド ──
 
-    def dim_v(self, y1, x_base, y2, label, left_side=True):
-        sign  = -1 if left_side else 1
-        x_dim = x_base + sign * DIM_OFFSET
+    def dim_h(self, x1, y_base, x2, label, above=True, level=1):
+        """水平寸法線 (JIS B 0001 準拠)
+
+        寸法値は寸法線の上に配置（白地矩形は不使用）。
+        level: 段重ね（1=最内側, 2=その外側...）
+        """
+        sc = max(self._sc, 0.5)  # 最低限のスケール
+        sign = -1 if above else 1
+        gap1 = DIM_GAP1_MM * sc
+        gap2 = DIM_GAP2_MM * sc
+        ext_gap = EXT_GAP_MM * sc
+        ext_over = EXT_OVER_MM * sc
+
+        y_dim = y_base + sign * (gap1 + gap2 * (level - 1))
+
+        # 寸法補助線（外形線と隙間を空けて延ばす）
+        for xp in (x1, x2):
+            y0 = y_base + sign * ext_gap       # 外形線との隙間
+            y1 = y_dim + sign * ext_over        # 寸法線の少し先まで延ばす
+            self.line(xp, min(y0, y1), xp, max(y0, y1),
+                      stroke=COLOR_DIM, sw=0.5)
+
+        # 寸法線
+        self.line(x1, y_dim, x2, y_dim, stroke=COLOR_DIM, sw=0.7)
+
+        # 矢印（スペースが狭い場合は外向き）
+        span = abs(x2 - x1)
+        if span > ARROW_LEN * 4:
+            self._arrow(x1, y_dim, 180)
+            self._arrow(x2, y_dim, 0)
+        else:
+            # 外向き矢印
+            self._arrow(x1, y_dim, 0)
+            self._arrow(x2, y_dim, 180)
+
+        # 寸法値: 寸法線の上に配置（above=True の場合はさらに上、above=False ならさらに下）
+        mx = (x1 + x2) / 2
+        text_offset = 6  # 寸法線から数値までのオフセット (px)
+        ty = y_dim - text_offset if above else y_dim + text_offset
+        self.text(mx, ty, label, size=LABEL_SIZE, color=COLOR_DIM)
+
+    def dim_v(self, y1, x_base, y2, label, left_side=True, level=1):
+        """垂直寸法線 (JIS B 0001 準拠)
+
+        寸法値は寸法線の左に配置（90° 回転、下→上方向に読む）。
+        level: 段重ね（1=最内側, 2=その外側...）
+        """
+        sc = max(self._sc, 0.5)
+        sign = -1 if left_side else 1
+        gap1 = DIM_GAP1_MM * sc
+        gap2 = DIM_GAP2_MM * sc
+        ext_gap = EXT_GAP_MM * sc
+        ext_over = EXT_OVER_MM * sc
+
+        x_dim = x_base + sign * (gap1 + gap2 * (level - 1))
+
+        # 寸法補助線
         for yp in (y1, y2):
-            x0 = x_base - sign * EXT_MARGIN
-            x1_ = x_dim + sign * 6
-            self.line(min(x0, x1_), yp, max(x0, x1_), yp, stroke=COLOR_DIM, sw=0.8)
-        self.line(x_dim, y1, x_dim, y2, stroke=COLOR_DIM, sw=0.9)
-        self._arrow(x_dim, y1, 270)
-        self._arrow(x_dim, y2, 90)
+            x0 = x_base + sign * ext_gap
+            x1_ = x_dim + sign * ext_over
+            self.line(min(x0, x1_), yp, max(x0, x1_), yp,
+                      stroke=COLOR_DIM, sw=0.5)
+
+        # 寸法線
+        self.line(x_dim, y1, x_dim, y2, stroke=COLOR_DIM, sw=0.7)
+
+        # 矢印（スペースが狭い場合は外向き）
+        span = abs(y2 - y1)
+        if span > ARROW_LEN * 4:
+            self._arrow(x_dim, y1, 270)
+            self._arrow(x_dim, y2, 90)
+        else:
+            self._arrow(x_dim, y1, 90)
+            self._arrow(x_dim, y2, 270)
+
+        # 寸法値: 寸法線の左（left_side の場合はさらに左）に 90° 回転配置
         my = (y1 + y2) / 2
-        self.rect(x_dim - 7, my - 22, 13, 44, fill="white", stroke="none", sw=0)
-        self.text_rotated(x_dim, my, label, -90, size=LABEL_SIZE, color=COLOR_DIM)
+        text_offset = 6
+        tx = x_dim - text_offset if left_side else x_dim + text_offset
+        self.text_rotated(tx, my, label, -90, size=LABEL_SIZE, color=COLOR_DIM)
 
     def center_cross(self, cx, cy, size=10):
         """中心線クロス（穴を正面から見たとき）"""
@@ -177,7 +248,6 @@ class SVGBuilder:
         """穴を軸方向から見た投影: 円＋中心線クロス"""
         if hidden:
             self.circle(cx, cy, r, stroke=COLOR_FEATURE_HIDDEN, sw=0.8, dash="4,2")
-            # 隠れ穴でも中心線は描く（やや薄く）
             self.center_cross(cx, cy, max(r + 4, 8))
         else:
             self.circle(cx, cy, r, stroke=COLOR_FEATURE, sw=1.2)
@@ -186,18 +256,11 @@ class SVGBuilder:
     def feature_side_h(self, cy, r, x_start, x_end, hidden=True):
         """穴を側面から見た投影（穴軸が水平方向）:
         2本の水平平行破線（穴径間隔）＋ 水平中心線（一点鎖線）
-
-        cy:      穴中心の Y 座標 (px)
-        r:       穴半径 (px)
-        x_start: 穴始端の X 座標 (px) — 面の外縁
-        x_end:   穴終端の X 座標 (px) — 壁厚だけ内側
         """
         stroke = COLOR_FEATURE_HIDDEN if hidden else COLOR_FEATURE
         dash   = "4,2"
-        # 2本の平行破線
         self.line(x_start, cy - r, x_end, cy - r, stroke=stroke, sw=0.8, dash=dash)
         self.line(x_start, cy + r, x_end, cy + r, stroke=stroke, sw=0.8, dash=dash)
-        # 中心線（一点鎖線）— 両端を少しはみ出す
         self.line(min(x_start, x_end) - CL_MARGIN, cy,
                   max(x_start, x_end) + CL_MARGIN, cy,
                   stroke=COLOR_CENTERLINE, sw=0.5, dash="8,3,2,3")
@@ -205,11 +268,6 @@ class SVGBuilder:
     def feature_side_v(self, cx, r, y_start, y_end, hidden=True):
         """穴を側面から見た投影（穴軸が垂直方向）:
         2本の垂直平行破線（穴径間隔）＋ 垂直中心線（一点鎖線）
-
-        cx:      穴中心の X 座標 (px)
-        r:       穴半径 (px)
-        y_start: 穴始端の Y 座標 (px) — 面の外縁
-        y_end:   穴終端の Y 座標 (px) — 壁厚だけ内側
         """
         stroke = COLOR_FEATURE_HIDDEN if hidden else COLOR_FEATURE
         dash   = "4,2"
@@ -237,7 +295,6 @@ class SVGBuilder:
 
 
 # ── インターフェース解析 ─────────────────────────────────────────────────────
-# (v2 から変更なし)
 
 def _parse_number(text, pattern):
     m = re.search(pattern, text)
@@ -336,7 +393,6 @@ def _resolve_hole_positions(iface, face, W, H, D, wall):
                 results.append((face, cx + off, cy, dia, label))
         else:
             if num_holes >= 2:
-                # center_dist 未指定: 同一座標への重複追加を防ぎ、幅方向に均等配置
                 print(f"⚠️ WARN: '{name}' の中心間距離が未指定。"
                       f"幅方向に均等配置します（要確認: requirements.json に spacing を追加推奨）")
                 spacing_fallback = W * 0.5
@@ -453,8 +509,77 @@ def extract_dims(req: dict, params: dict) -> dict:
 
 # ── ラベル重複防止ヘルパー ────────────────────────────────────────────────────
 
-def _label_key(label, px, py, grid=20):
-    return f"{label}_{round(px/grid)}_{round(py/grid)}"
+def _make_label_placer(svg):
+    """ラベル重複を防止するクロージャを返す"""
+    drawn_labels = []
+    drawn_keys = set()
+
+    def place_label(x, y, label, ox_off, oy_off):
+        if label in drawn_keys:
+            return
+        drawn_keys.add(label)
+
+        lx, ly = x + ox_off, y + oy_off
+        for _ in range(15):
+            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
+                break
+            ly += 14
+        if abs(ly - (y + oy_off)) > 1:
+            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly,
+                     stroke=COLOR_HIDDEN, sw=0.5)
+        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
+        drawn_labels.append((lx, ly))
+
+    return place_label
+
+
+# ── 穴位置寸法の収集と描画 ────────────────────────────────────────────────────
+
+def _draw_hole_position_dims(svg, d, features_in_view, view_face, ox, oy, sc,
+                              view_w_mm, view_h_mm, above_h=True, left_v=True):
+    """フィーチャーの基準面からの位置寸法を描画する。
+
+    features_in_view: [(face, fx_mm, fy_mm, dia, label), ...] — このビューで円として見える穴
+    view_w_mm, view_h_mm: ビューの実寸幅・高さ (mm)
+    """
+    if not features_in_view:
+        return
+
+    # 重複座標を除去して、ユニークな位置を収集
+    x_positions = {}  # mm_x -> label
+    y_positions = {}  # mm_y -> label
+
+    for face, fx, fy, dia, label in features_in_view:
+        # X 方向: 左端面からの距離（端点付近でない場合のみ）
+        if 3 < fx < view_w_mm - 3:
+            x_key = round(fx, 1)
+            if x_key not in x_positions:
+                x_positions[x_key] = label
+        # Y 方向: 上端面からの距離
+        if 3 < fy < view_h_mm - 3:
+            y_key = round(fy, 1)
+            if y_key not in y_positions:
+                y_positions[y_key] = label
+
+    # X 方向の穴位置寸法（左端面を基準）
+    dim_level_h = 2  # level 1 は外形寸法に使うことが多い
+    for x_mm in sorted(x_positions.keys()):
+        px = ox + x_mm * sc
+        svg.dim_h(ox, oy if above_h else oy + view_h_mm * sc, px,
+                  f"{x_mm:.1f}", above=above_h, level=dim_level_h)
+        dim_level_h += 1
+        if dim_level_h > 4:  # 最大4段まで
+            break
+
+    # Y 方向の穴位置寸法（上端面を基準）
+    dim_level_v = 2
+    for y_mm in sorted(y_positions.keys()):
+        py = oy + y_mm * sc
+        svg.dim_v(oy, ox if left_v else ox + view_w_mm * sc, py,
+                  f"{y_mm:.1f}", left_side=left_v, level=dim_level_v)
+        dim_level_v += 1
+        if dim_level_v > 4:
+            break
 
 
 # ── 各ビューの描画 ────────────────────────────────────────────────────────────
@@ -477,7 +602,7 @@ def draw_front(svg, d, ox, oy, sc):
     """正面図 — 視線 -Z方向、XY 平面を見る (W × H)"""
     W  = d["width"]  * sc
     H  = d["height"] * sc
-    wp = d["wall"]   * sc   # wall in px
+    wp = d["wall"]   * sc
     fr = d["fillet"]  * sc
 
     fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
@@ -487,60 +612,47 @@ def draw_front(svg, d, ox, oy, sc):
 
     # 外形 + 内壁隠れ線
     svg.rect(ox, oy, W, H, fill=COLOR_FACE_FRONT, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
-
     svg.rect(ox + wp, oy + wp, W - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
              rx=max(0.0, fr - wp))
-    drawn_labels = []
-    drawn_keys = set()
-    def place_label(x, y, label, ox_off, oy_off):
-        if label in drawn_keys:
-            return
-        drawn_keys.add(label)
-        
-        lx, ly = x + ox_off, y + oy_off
-        for _ in range(15):
-            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
-                break
-            ly += 14
-        if abs(ly - (y + oy_off)) > 1:
-            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
-        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
-        drawn_labels.append((lx, ly))
 
-
+    place_label = _make_label_placer(svg)
+    circle_features = []  # 円として描画されるフィーチャー（位置寸法用）
 
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
         if face == "front":
-            # 軸 +Z ∥ 視線 → 実線の円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=False)
             place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
+            circle_features.append((face, fx, fy, dia, label))
 
         elif face == "back":
-            # 軸 -Z ∥ 視線 (裏側) → 隠れ線の円
             cx, cy = ox + fx * sc, oy + fy * sc
-
             svg.feature_circle(cx, cy, r, hidden=True)
             place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
+            circle_features.append((face, fx, fy, dia, label))
 
         elif face == "bottom":
-            # 軸 -Y ⊥ 視線 → 2本の垂直破線 (底辺から壁厚分)
             cx = ox + fx * sc
             svg.feature_side_v(cx, r, oy + H - wp, oy + H, hidden=True)
             place_label(cx, oy + H - wp, label, max(r+6, 12), -6)
 
         elif face == "top":
-            # 軸 +Y ⊥ 視線 → 2本の垂直破線 (上辺から壁厚分)
             cx = ox + fx * sc
             svg.feature_side_v(cx, r, oy, oy + wp, hidden=True)
 
-    # 寸法線
-    # svg.dim_h(ox, oy, ox + W, f"{d['width']:.0f}", above=True) # 底面図とダブるため省略
-    svg.dim_v(oy, ox, oy + H, f"{d['height']:.0f}", left_side=True)
-    svg.view_title(ox + W/2, oy + H + 30, "正面図 FRONT VIEW")
+    # 寸法線 — 高さ (左側, level=1)
+    svg.dim_v(oy, ox, oy + H, f"{d['height']:.0f}", left_side=True, level=1)
+
+    # 穴位置寸法
+    _draw_hole_position_dims(svg, d, circle_features, "front",
+                              ox, oy, sc, d["width"], d["height"],
+                              above_h=True, left_v=True)
+
+    # ビュー名（ビューの下に配置）
+    svg.view_title(ox + W/2, oy + H + 25, "正面図 FRONT VIEW")
 
 
 def draw_side(svg, d, ox, oy, sc):
@@ -554,62 +666,42 @@ def draw_side(svg, d, ox, oy, sc):
 
     fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
     if any(fl.values()):
-        svg.rect(ox + Dp - wp, oy - fl["t"]*sc, wp, H + (fl["t"]+fl["b"])*sc, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
+        svg.rect(ox + Dp - wp, oy - fl["t"]*sc, wp, H + (fl["t"]+fl["b"])*sc,
+                 fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
 
     svg.rect(ox, oy, Dp, H, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
     svg.rect(ox + wp, oy + wp, Dp - 2*wp, H - 2*wp,
              fill="none", stroke=COLOR_HIDDEN, sw=0.9, dash="6,3",
              rx=max(0.0, fr - wp))
-    drawn_labels = []
-    drawn_keys = set()
-    def place_label(x, y, label, ox_off, oy_off):
-        if label in drawn_keys:
-            return
-        drawn_keys.add(label)
-        
-        lx, ly = x + ox_off, y + oy_off
-        for _ in range(15):
-            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
-                break
-            ly += 14
-        if abs(ly - (y + oy_off)) > 1:
-            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
-        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
-        drawn_labels.append((lx, ly))
 
-
+    place_label = _make_label_placer(svg)
 
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
         if face == "front":
-            # 軸 +Z ⊥ 視線 → 2本の水平破線（前面=左端から壁厚分）
             cy = oy + fy * sc
             svg.feature_side_h(cy, r, ox, ox + wp, hidden=True)
             place_label(ox + wp + 4, cy, label, 12, -max(r+3, 8))
 
         elif face == "back":
-            # 軸 -Z ⊥ 視線 → 2本の水平破線（背面=右端から壁厚分）
             cy = oy + fy * sc
-            
             svg.feature_side_h(cy, r, ox + Dp - wp, ox + Dp, hidden=True)
             place_label(ox + Dp - wp - 4, cy, label, -12, -max(r+3, 8))
 
         elif face == "bottom":
-            # 軸 -Y ⊥ 視線 → 2本の垂直破線（底辺から壁厚分）
-            # fy は底面上の depth 方向座標 → 側面図の u 座標
             cu = ox + fy * sc
             svg.feature_side_v(cu, r, oy + H - wp, oy + H, hidden=True)
             place_label(cu, oy + H - wp, label, max(r+6, 10), -6)
 
         elif face == "side":
-            # 軸 ±X ∥ 視線 → 円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=False)
 
-    svg.dim_h(ox, oy, ox + Dp, f"{d['depth']:.0f}", above=True)
-    svg.dim_v(oy, ox + Dp, oy + H, f"{d['height']:.0f}", left_side=False)
-    svg.view_title(ox + Dp/2, oy + H + 30, "側面図 SIDE VIEW")
+    # 寸法線
+    svg.dim_h(ox, oy, ox + Dp, f"{d['depth']:.0f}", above=True, level=1)
+    svg.dim_v(oy, ox + Dp, oy + H, f"{d['height']:.0f}", left_side=False, level=1)
+    svg.view_title(ox + Dp/2, oy + H + 25, "右側面図 RIGHT SIDE VIEW")
 
 
 def draw_bottom(svg, d, ox, oy, sc):
@@ -623,7 +715,8 @@ def draw_bottom(svg, d, ox, oy, sc):
 
     fl = d.get("flange", {"l":0, "r":0, "t":0, "b":0})
     if any(fl.values()):
-        svg.rect(ox - fl["l"]*sc, oy + Dp - wp, W + (fl["l"]+fl["r"])*sc, wp, fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
+        svg.rect(ox - fl["l"]*sc, oy + Dp - wp, W + (fl["l"]+fl["r"])*sc, wp,
+                 fill=COLOR_FACE_SIDE, stroke=COLOR_OUTLINE, sw=1.5, rx=0)
 
     svg.rect(ox, oy, W, Dp, fill=COLOR_FACE_TOP, stroke=COLOR_OUTLINE, sw=2.0, rx=fr)
     svg.rect(ox + wp, oy + wp, W - 2*wp, Dp - 2*wp,
@@ -638,50 +731,30 @@ def draw_bottom(svg, d, ox, oy, sc):
                  fill="none", stroke="#4477aa", sw=0.8, dash="3,3")
         pcb_label = d["pcb"].get("label", "PCB")
         svg.text(ox + W/2, oy + Dp/2, pcb_label, size=8, color="#4477aa")
-    drawn_labels = []
-    drawn_keys = set()
-    def place_label(x, y, label, ox_off, oy_off):
-        if label in drawn_keys:
-            return
-        drawn_keys.add(label)
-        
-        lx, ly = x + ox_off, y + oy_off
-        for _ in range(15):
-            if not any(abs(lx - ex) < 35 and abs(ly - ey) < 14 for ex, ey in drawn_labels):
-                break
-            ly += 14
-        if abs(ly - (y + oy_off)) > 1:
-            svg.line(x, y, lx - 10 if ox_off > 0 else lx + 10, ly, stroke=COLOR_HIDDEN, sw=0.5)
-        svg.feature_label(lx, ly, label, offset_x=0, offset_y=0)
-        drawn_labels.append((lx, ly))
 
-
+    place_label = _make_label_placer(svg)
+    circle_features = []
 
     for face, fx, fy, dia, label in d["features"]:
         r = (dia / 2) * sc
 
         if face == "bottom":
-            # 軸 -Y ∥ 視線 → 実線の円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=False)
             place_label(cx, cy, label, max(r+6, 12), -max(r+4, 10))
+            circle_features.append((face, fx, fy, dia, label))
 
         elif face == "top":
-            # 軸 +Y ∥ 視線 (裏側) → 隠れ線の円
             cx, cy = ox + fx * sc, oy + fy * sc
             svg.feature_circle(cx, cy, r, hidden=True)
 
         elif face == "front":
-            # 軸 +Z ⊥ 視線 → 2本の水平破線（前端=上端から壁厚分）
-            # front 穴は (fx, fy) = (X座標, Y/高さ座標)。底面図では X が u。
             cu = ox + fx * sc
             svg.feature_side_v(cu, r, oy, oy + wp, hidden=True)
             place_label(cu, oy + wp, label, max(r+6, 12), 10)
 
         elif face == "back":
-            # 軸 -Z ⊥ 視線 → 2本の垂直破線（背面端=下端から壁厚分）
             cu = ox + fx * sc
-            
             svg.feature_side_v(cu, r, oy + Dp - wp, oy + Dp, hidden=True)
             place_label(cu, oy + Dp - wp, label, max(r+6, 12), -6)
 
@@ -691,7 +764,7 @@ def draw_bottom(svg, d, ox, oy, sc):
         xs = sorted(set(round(fx, 2) for fx, fy in bottom_feats))
         if len(xs) >= 2:
             svg.dim_h(ox + xs[0]*sc, oy + Dp + 5,
-                      ox + xs[-1]*sc, f"{xs[-1]-xs[0]:.0f}", above=False)
+                      ox + xs[-1]*sc, f"{xs[-1]-xs[0]:.0f}", above=False, level=2)
 
     # 背面取付穴ピッチ寸法
     back_feats = [(fx, fy) for f, fx, fy, dia, lbl in d["features"] if f == "back"]
@@ -699,15 +772,64 @@ def draw_bottom(svg, d, ox, oy, sc):
         bxs = sorted(set(round(fx, 2) for fx, fy in back_feats))
         if len(bxs) >= 2:
             svg.dim_h(ox + bxs[0]*sc, oy - 5,
-                      ox + bxs[-1]*sc, f"P.C.D {bxs[-1]-bxs[0]:.0f}", above=True)
+                      ox + bxs[-1]*sc, f"P.C.D {bxs[-1]-bxs[0]:.0f}", above=True, level=2)
 
     # 外形寸法
-    svg.dim_h(ox, oy + Dp + 28, ox + W, f"{d['width']:.0f}", above=False)
-    svg.dim_v(oy, ox + W, oy + Dp, f"{d['depth']:.0f}", left_side=False)
-    svg.view_title(ox + W/2, oy - 45, "底面図 BOTTOM VIEW")
+    svg.dim_h(ox, oy + Dp, ox + W, f"{d['width']:.0f}", above=False, level=1)
+    svg.dim_v(oy, ox + W, oy + Dp, f"{d['depth']:.0f}", left_side=False, level=1)
+
+    # 穴位置寸法（底面ビューの円として見える穴）
+    _draw_hole_position_dims(svg, d, circle_features, "bottom",
+                              ox, oy, sc, d["width"], d["depth"],
+                              above_h=True, left_v=True)
+
+    # ビュー名（ビューの上に配置 — JIS ではビュー名は上が標準）
+    svg.view_title(ox + W/2, oy - 30, "底面図 BOTTOM VIEW")
 
 
+# ── 投影法記号 ────────────────────────────────────────────────────────────────
 
+def draw_projection_symbol(svg, cx, cy, size=20):
+    """JIS B 0001 第三角法の投影法記号を描画
+
+    截頭円錐の正面図（台形）と右側面図（同心円2つ）で構成。
+    cx, cy: シンボルの中心座標
+    size: シンボルの基本サイズ
+    """
+    s = size
+    gap = s * 0.6  # 正面図と側面図の間隔
+
+    # 左側: 正面図（台形 = 截頭円錐を正面から見たもの）
+    trap_cx = cx - gap
+    # 台形: 上辺が短く下辺が長い
+    top_w = s * 0.4
+    bot_w = s * 0.8
+    h = s * 0.7
+    pts = [
+        (trap_cx - top_w/2, cy - h/2),
+        (trap_cx + top_w/2, cy - h/2),
+        (trap_cx + bot_w/2, cy + h/2),
+        (trap_cx - bot_w/2, cy + h/2),
+    ]
+    svg.polygon(pts, fill="none", stroke=COLOR_OUTLINE, sw=1.2)
+    # 中心線（水平）
+    svg.line(trap_cx - bot_w/2 - 3, cy, trap_cx + bot_w/2 + 3, cy,
+             stroke=COLOR_CENTERLINE, sw=0.5, dash="4,2,1,2")
+
+    # 右側: 側面図（同心円2つ = 截頭円錐を横から見たもの）
+    circle_cx = cx + gap
+    r_outer = s * 0.4
+    r_inner = s * 0.2
+    svg.circle(circle_cx, cy, r_outer, stroke=COLOR_OUTLINE, sw=1.2)
+    svg.circle(circle_cx, cy, r_inner, stroke=COLOR_OUTLINE, sw=1.2)
+    # 中心線クロス
+    svg.line(circle_cx - r_outer - 3, cy, circle_cx + r_outer + 3, cy,
+             stroke=COLOR_CENTERLINE, sw=0.5, dash="4,2,1,2")
+    svg.line(circle_cx, cy - r_outer - 3, circle_cx, cy + r_outer + 3,
+             stroke=COLOR_CENTERLINE, sw=0.5, dash="4,2,1,2")
+
+
+# ── タイトルブロック ──────────────────────────────────────────────────────────
 
 def draw_title_block(svg, d, cw, ch, pad, th):
     ty = ch - th
@@ -728,7 +850,7 @@ def draw_title_block(svg, d, cw, ch, pad, th):
              "技術図面 / TECHNICAL DRAWING",
              size=14, color=COLOR_SUBTITLE, anchor="end")
     svg.text(pad + tw - 24, ty + th * 0.72,
-             f"作成日: {today}  |  text-to-cad skill v4",
+             f"作成日: {today}  |  text-to-cad skill v5",
              size=11, color=COLOR_SUBTITLE, anchor="end")
 
 
@@ -738,32 +860,47 @@ def generate_svg(req_data, param_data, output_path):
     d = extract_dims(req_data, param_data)
     W, D, H = d["width"], d["depth"], d["height"]
 
-    svg = SVGBuilder(CANVAS_W, CANVAS_H)
-    svg.rect(0, 0, CANVAS_W, CANVAS_H, fill=COLOR_BG, stroke="none", sw=0)
-
+    # ── レイアウト計算 (第三角法: 正面=左下, 平面=左上, 側面=右下) ──
     da_x, da_y = PADDING, PADDING
     da_w = CANVAS_W - PADDING * 2
     da_h = CANVAS_H - PADDING * 2 - TITLE_H
-    svg.rect(da_x, da_y, da_w, da_h, fill="#f9f9fd", stroke="#ccccdd", sw=1.0, rx=4)
 
-    left_w    = da_w       # 3面図で全幅を使う
-    inner_pad = PADDING * 1.2
+    inner_pad = PADDING * 1.4
     max_sc_x  = (da_w - VIEW_GAP - inner_pad * 2) / (W + D)
     max_sc_y  = (da_h - VIEW_GAP - inner_pad * 3) / (D + H)
     sc = min(max_sc_x, max_sc_y, 5.0)
 
-    v_ox, v_oy = da_x + inner_pad, da_y + inner_pad
-    plan_ox,  plan_oy  = v_ox,                   v_oy
-    front_ox, front_oy = v_ox,                   v_oy + D*sc + VIEW_GAP
-    side_ox,  side_oy  = v_ox + W*sc + VIEW_GAP, front_oy
+    svg = SVGBuilder(CANVAS_W, CANVAS_H, scale=sc)
+    svg.rect(0, 0, CANVAS_W, CANVAS_H, fill=COLOR_BG, stroke="none", sw=0)
 
-    draw_bottom(svg, d, plan_ox, plan_oy, sc)
-    draw_front(svg, d, front_ox, front_oy, sc)
-    draw_side(svg, d, side_ox, side_oy, sc)
+    # 描画領域の枠
+    svg.rect(da_x, da_y, da_w, da_h, fill="#f9f9fd", stroke="#ccccdd", sw=1.0, rx=4)
 
-    svg.text(da_x + 10, da_y + da_h - 12,
-             "第三角法 / Third-angle projection",
-             size=10, color="#aaaaaa", anchor="start", italic=True)
+    # ── ビュー配置（第三角法 standard） ──
+    # 正面図 (W × H) を基準位置として配置
+    front_ox = da_x + inner_pad
+    front_oy = da_y + inner_pad + D * sc + VIEW_GAP     # 平面図の下
+
+    # 平面図（底面図: W × D）は正面図の真上
+    plan_ox  = front_ox                                   # X は正面図と揃える
+    plan_oy  = da_y + inner_pad                           # 上部に配置
+
+    # 右側面図 (D × H) は正面図の右
+    side_ox  = front_ox + W * sc + VIEW_GAP
+    side_oy  = front_oy                                   # Y は正面図と揃える
+
+    # ── 描画 ──
+    draw_bottom(svg, d, plan_ox, plan_oy, sc)          # 平面図位置に底面図
+    draw_front(svg, d, front_ox, front_oy, sc)         # 正面図
+    draw_side(svg, d, side_ox, side_oy, sc)            # 右側面図
+
+    # 投影法記号（タイトルブロックの左上付近）
+    proj_sym_x = CANVAS_W - PADDING - 100
+    proj_sym_y = CANVAS_H - TITLE_H - 30
+    draw_projection_symbol(svg, proj_sym_x, proj_sym_y, size=18)
+    svg.text(proj_sym_x, proj_sym_y + 18, "第三角法",
+             size=9, color="#888888", anchor="middle")
+
     draw_title_block(svg, d, CANVAS_W, CANVAS_H, PADDING, TITLE_H)
 
     # フィーチャーサマリ

@@ -1,30 +1,49 @@
 # text-to-cad 改善ログ
 
-## 2026-03-08: パイプライン構造改善 — geometry_tree・視覚的契約・段階的検証の導入
-- **きっかけ**: 振り返り改善 — DHT22_CASE_ver2 で Stage 2 SVG は正しかったが STEP 出力が大きく乖離。専門家議論でアーキテクチャレベルの問題を特定
-- **ギャップ**: 取付耳が `rect_pad` で記述され外形と乖離、ボスの押し出し方向が逆、feature_mapping が「フラットな操作リスト」で設計意図の構造を表現できなかった
-- **根本原因**: 指示不足＋参照情報不足＋スコープ曖昧 — フィーチャータイプの列挙型アプローチの限界。外形輪郭の拡張を表現する手段がなく、LLM の 3D 空間認識の弱さを補う構造的安全ネットが不足
+## 2026-03-08: Stage 2 SVG 図面の JIS B 0001 準拠化（Phase 1）
+- **きっかけ**: 振り返り改善 — DHT22_CASE_ver2 の SVG 図面が日本の 2D 図面作法（JIS B 0001）に準拠していなかった
+- **ギャップ**: 寸法値が白地矩形で寸法線中央に配置（JIS は上/左）、ビュー配置が非標準、矢印の開き角過大、穴位置寸法なし、投影法記号なし
+- **根本原因**: 指示不足＋参照情報不足 — JIS B 0001 の寸法配置ルールがスクリプトに未反映、スケール値がビルダーに未保持
 - **変更内容**:
-  - `references/feature_mapping_schema.md` を全面改訂: `geometry_tree`（プリミティブ + Boolean 木）で外形を記述する 2 レイヤー構造を導入。`finishing` ブロック追加。`extrude_direction` 追加
-  - `SKILL.md` の Stage 3.5 を **3.5a（ジオメトリ分解）/ 3.5b（視覚的契約）/ 3.5c（フィーチャーアプリケーション）** に分割。Stage 4 に段階的フィードバック（高リスク操作後の中間検証）指示を追加
-  - `references/cadquery_patterns.md` の統合ビルドテンプレートを geometry_tree 駆動の 3 フェーズ構成に改訂
-  - `scripts/stage3_5_preview_svg.py` を新規作成: geometry_tree から簡易 3 面図 SVG を生成（Python 標準ライブラリのみ）
-
-## 2026-03-08: Stage 4 STEP生成品質の抜本的改善（フィーチャーマッピング導入）
-- **きっかけ**: 振り返り改善 — DHT22センサーケース設計で Stage 1-2 の要件・図面と Stage 4 の STEP 出力が大きく乖離
-- **ギャップ**: 穴が意図しない面に開く、取付耳の位置が異常、ボスが外側に突出、蓋に嵌合構造なし等、形状が全面的に破綻
-- **根本原因**: 指示不足＋参照情報不足＋手順の順序問題 — requirements.json の `position` と CadQuery 面セレクタの対応ルールがなく、LLM が3D空間を推測でコーディングしていた。CADAM比較から「LLMの自由度を制約で狭める」原則を学んだ
-- **変更内容**:
-  - `SKILL.md` に **Stage 3.5「フィーチャーマッピング」を新設**。面指定・座標・ビルド順序を明示するJSON中間表現を導入。複数形状タイプ（box_shell / cylinder_shell / plate / bracket_L / bracket_U）に汎用的に対応
-  - `SKILL.md` の Stage 4 を**フィーチャーマッピング駆動**に改訂。面セレクタはマッピングから転記（推測禁止）、セマンティック検証を追加
-  - `references/feature_mapping_schema.md` を新規作成。5種のベース形状タイプとフィーチャータイプの詳細スキーマを定義
-  - `references/cadquery_patterns.md` に**統合ビルドテンプレート**、円柱シェル・L字ブラケットのパターンを追加
-  - `scripts/stage4_validate_shape.py` を新規作成。BB寸法・穴数・体積のセマンティック検証
+  - `SVGBuilder` に `scale` 引数追加、寸法間隔をスケール依存計算に
+  - `dim_h()` / `dim_v()` を JIS 準拠化: 寸法値を上/左配置、白地矩形廃止、`level` 段重ね対応、外向き矢印対応
+  - 矢印定数修正（`ARROW_LEN=8, ARROW_W=2.3`、開き角 ≈ 30°）
+  - ビュー配置を第三角法標準に（正面図=左下、平面図=左上、側面図=右下）
+  - `draw_projection_symbol()` 新規追加（第三角法記号）
+  - `_draw_hole_position_dims()` 追加（穴位置寸法の自動配置）
+  - `_make_label_placer()` でラベル重複防止ロジックをクロージャに抽出
 
 ## 2026-03-08: Stage 2 SVG品質問題（重複穴・重複ラベル）の修正
 - **きっかけ**: 直後フィードバック — 正面図の四隅に穴が2重に描かれ、「M4取付」等のラベルがかぶって読めない
 - **ギャップ**: 素人でも気づく図面ミス（重複穴・重複ラベル・PCBラベル決め打ち）が発生していた
 - **根本原因**: 指示不足＋手順の順序問題 — SVG生成後にClaudeが出力を品質確認するよう指示されていなかった。またスクリプトの `_resolve_hole_positions()` が center_dist 未指定時に同一座標の穴を num_holes 個追加するバグがあった
 - **変更内容**:
-  - `skills/text-to-cad/scripts/stage3_export_xlsx.py` を新規作成。`openpyxl` を用いて、色分け・列幅調整・枠固定を施した見やすいエクセル（.xlsx）を生成できるようにした。
-  - `SKILL.md` の Stage 3 のチェックポイントに、エクセル生成の指示および JSON の `bom` 構造（用途、ミスミ/モノタロウ推奨品番等）の要件を明記した。
+  - SKILL.md: Stage 2 ワークフローに「Claude 自己QC（必須）」ステップを追加。`⚠️ WARN:` 0件確認・フィーチャー数整合・重複チェックを必須化
+  - SKILL.md: ユーザー案内文に「おかしいな」と気づくためのNG例リスト（素人向け）を追加
+  - stage2_svg_views.py: `_resolve_hole_positions()` の bottom face フォールバック修正 — center_dist 未指定かつ num_holes≥2 の場合、同一座標リピートではなく幅方向均等配置に変更し `⚠️ WARN:` を出力
+  - stage2_svg_views.py: `draw_bottom()` の PCB ラベルを "DHT22" 決め打ちから `internal_components[].name` の動的取得に変更
+
+## 2026-03-07: Stage 2 SVG図面にインターフェース（穴・開口）描画要件を追加
+- **きっかけ**: 直後フィードバック（DHT22センサーケース設計時）
+- **ギャップ**: requirements.json に5種類のインターフェース（PG7穴、LED穴、壁取付穴、ベント穴、M3インサート穴）を定義したが、SVG図面にはただの直方体3面図しか出力されず、穴・開口が一切描画されなかった
+- **根本原因**: 指示不足＋参照情報不足 — SKILL.md の Stage 2 セクションに interfaces 配列を描画する設計要件が記載されておらず、スクリプトも interfaces をパースしない構造だった
+- **変更内容**:
+  - SKILL.md: Stage 2 に「インターフェース描画」サブセクション追加（描画ルール、extract_dims()設計指針、等角図での簡易表現）
+  - SKILL.md: ユーザーへの案内文の確認ポイントを4項目に拡充
+  - stage2_svg_views.py: extract_dims() を全面リファクタし interfaces 配列をパースする機能を追加
+  - stage2_svg_views.py: _classify_face() / _resolve_hole_positions() / _make_label() を新設。position文字列からヒューリスティックに描画面と座標を算出
+  - stage2_svg_views.py: _draw_features_on_view() ヘルパーで各ビューにフィーチャー（実線円＋中心線＋ラベル）を描画。隠れ線投影にも対応
+  - stage2_svg_views.py: 上面図 → 底面図に変更（底面にフィーチャーがある場合）。背面取付穴も底面図上に投影表示
+  - stage2_svg_views.py: 等角図にフィーチャーの中心マーカー＋ラベルを表示（背面は非表示）
+  - DHT22 requirements.json で検証: 12フィーチャー（PG7×2, VENT×1, LED×1, M3 ins.×4, M4取付×4）すべて描画成功
+
+## 2026-03-07: Stage 2 正投影図法準拠の穴投影を実装 (v3)
+- **きっかけ**: 直後フィードバック — 正面図の円穴が側面図でも円で描かれていた
+- **ギャップ**: 図面のルールとして、穴軸⊥視線の場合は「2本の平行破線＋中心線」で描くべきところ、全ビューで円描画していた
+- **根本原因**: 指示不足 — 正投影図法のルール（穴軸と視線の関係）がスクリプトに実装されていなかった
+- **変更内容**:
+  - SKILL.md: 描画ルールを「穴軸∥視線→円、軸⊥視線→2本破線+中心線」に書き直し、ビュー×面の投影対応表を追加
+  - stage2_svg_views.py: SVGBuilder に feature_side_h() / feature_side_v() メソッドを追加（2本平行破線＋一点鎖線中心線を描画）
+  - stage2_svg_views.py: 汎用の _draw_features_on_view() を廃止し、各 draw_front/draw_side/draw_bottom 内で穴軸と視線の関係に基づいて描画方法を分岐
+  - stage2_svg_views.py: 中心線クロスを一点鎖線パターン(8,3,2,3)に変更
+  - DHT22 requirements.json で検証: 実線円8個、隠れ円4個、平行破線24組、中心線64本 — 全投影が正しいことを確認

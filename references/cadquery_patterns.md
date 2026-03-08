@@ -223,6 +223,191 @@ cq.exporters.export(body, "preview_body.stl")
 | `face selector returns empty` | shell/cut 後に面構成が変化 | offset workplane 方式に切り替え |
 | `Null TopoDS_Shape` | 形状が破綻（ゼロ厚み等） | 肉厚を大きくする、形状を単純化 |
 
+## パターン7: 円柱シェル（cylinder_shell）
+
+```python
+import cadquery as cq
+import json
+
+with open("parameters.json") as f:
+    params = json.load(f)
+
+def p(cat, key):
+    return params[cat][key]["value"]
+
+OD = p("outer_envelope", "outer_diameter")
+H  = p("outer_envelope", "height")
+wall = p("global", "wall_thickness")
+
+# 基本形状
+body = cq.Workplane("XY").cylinder(H, OD / 2)
+
+# シェル（上面を開放）
+body = body.faces(">Z").shell(-wall)
+
+# 端面に穴
+body = (
+    body.faces("<Z").workplane()
+    .hole(p("features", "bottom_hole_dia"))
+)
+
+# 円筒側面の穴（角度指定）
+# ⚠️ 円筒面を選択するには RadiusNthSelector または >X, <X 等
+body = (
+    body.faces(">X").workplane()
+    .center(0, 10)  # Z方向オフセット
+    .hole(p("features", "side_hole_dia"))
+)
+
+cq.exporters.export(body, "P001_cylinder_body.step")
+```
+
+## パターン8: L字ブラケット（bracket_L）
+
+```python
+import cadquery as cq
+
+base_W, base_D, base_T = 50, 30, 3
+wall_W, wall_H, wall_T = 50, 40, 3
+inner_R = 3
+
+# 底板
+base = cq.Workplane("XY").box(base_W, base_D, base_T)
+
+# 立ち上がり壁（底板の+Y端に接続）
+wall = (
+    cq.Workplane("XY")
+    .workplane(offset=base_T / 2)
+    .center(0, base_D / 2 - wall_T / 2)
+    .box(wall_W, wall_T, wall_H)
+    .translate((0, 0, wall_H / 2))
+)
+
+bracket = base.union(wall)
+
+# 底板に取付穴
+bracket = (
+    bracket.faces("<Z").workplane()
+    .rect(30, 20, forConstruction=True).vertices()
+    .hole(4.5)
+)
+
+cq.exporters.export(bracket, "bracket_L.step")
+```
+
+---
+
+## 統合ビルドテンプレート（最重要）
+
+個別パターンを組み合わせて1つの部品を作る際の**標準手順**。
+Stage 3.5 の `feature_mapping.json` に従い、以下の順序でコードを組み立てる。
+
+### なぜ順序が重要か
+
+CadQuery/OpenCASCADE は操作ごとに面・エッジの構成が変わる。
+特に `shell()` と `union()` の後は、面セレクタ（`>Z` 等）が拾う面が変わる。
+**面に対する加工（穴・ポケット）は、その面が最終形状になった後に行う。**
+
+### box_shell 型のビルド手順
+
+```python
+import cadquery as cq
+import json
+
+# ── Step 0: パラメータ読み込み ──
+with open("parameters.json") as f:
+    params = json.load(f)
+with open("feature_mapping.json") as f:
+    fmap = json.load(f)
+
+def p(cat, key):
+    return params[cat][key]["value"]
+
+W = p("outer_envelope", "width")
+D = p("outer_envelope", "depth")
+H = p("outer_envelope", "height")
+wall = p("global", "wall_thickness")
+
+# ── Step 1: ベース形状 (build_order: 1) ──
+body = cq.Workplane("XY").box(W, D, H)
+
+# ── Step 2: 外周フィレット (build_order: 2) ──
+# ⚠️ shell の前にフィレット！
+body = body.edges("|Z").fillet(p("global", "fillet_radius"))
+
+# ── Step 3: シェル化 (build_order: 3) ──
+body = body.faces(">Z").shell(-wall)
+
+# ── Step 4+: 各面のフィーチャー (build_order: 4〜) ──
+# feature_mapping.json の build_order 順に実行
+
+# feature: PG7_left | face: -Z
+body = (
+    body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
+    .center(-15, 5)
+    .hole(12.5)
+)
+
+# feature: PG7_right | face: -Z
+body = (
+    body.faces("<Z").workplane(centerOption="CenterOfBoundBox")
+    .center(15, 5)
+    .hole(12.5)
+)
+
+# ── Step N: ボス・スタンドオフ ──
+# shell 後の内底面は offset workplane で取得
+# ⚠️ .faces("<Z[-2]") は不安定！offset 方式を使う
+
+# feature: M3_boss_array | face: inner_bottom
+wp = body.faces("<Z").workplane(offset=wall)
+body = (
+    wp.pushPoints([(27, 34.5), (-27, 34.5), (27, -34.5), (-27, -34.5)])
+    .circle(4).extrude(H - wall - 5)  # 蓋嵌合面近くまで
+)
+
+# ── Step N+1: 追加形状 (耳等) ──
+# union 後の穴あけに注意
+
+# feature: mounting_ear_top | face: +Y
+ear = (
+    cq.Workplane("XY")
+    .workplane(offset=-H/2 + wall/2)
+    .center(0, D/2 + 7.5)
+    .box(W, 15, wall)
+)
+body = body.union(ear)
+
+# feature: M4_mount_top | face: +Y (耳上)
+body = (
+    body.faces(">Y").workplane(centerOption="CenterOfBoundBox")
+    .center(0, 32.5)
+    .hole(4.5)
+)
+
+cq.exporters.export(body, "P001_body.step")
+```
+
+### cylinder_shell 型のビルド手順
+
+同じ原則: `cylinder()` → `shell()` → 端面フィーチャー → 側面フィーチャー
+
+### plate 型のビルド手順
+
+薄い `box()` → `fillet()` → 穴あけ → 嵌合スカート `extrude`
+
+### 重要な注意事項
+
+1. **shell() 後の内面は `.workplane(offset=wall)` で取得する**
+   - `.faces("<Z[-2]")` のようなインデックスセレクタは面構成の変化で不安定
+2. **union() 後に穴を開ける**
+   - union 前の個別パーツに穴を開けてから union すると、穴が埋まることがある
+3. **各フィーチャーのコードに ID コメントを付ける**
+   - `# feature: PG7_left | face: -Z` のように、feature_mapping との対応を明示
+4. **1フィーチャー=1操作を原則にする**
+   - pushPoints でまとめて穴を開けるのはOK（同一パターンの穴グループの場合）
+   - 異なるタイプのフィーチャーは別操作にする
+
 ## CadQuery インストール確認
 
 ```bash
